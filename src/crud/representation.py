@@ -28,6 +28,39 @@ from src.utils.types import embedding_call_purpose
 logger = logging.getLogger(__name__)
 
 
+def _representation_counts(
+    *,
+    total: int,
+    include_semantic_query: str | None,
+    semantic_search_top_k: int | None,
+    include_most_derived: bool,
+) -> tuple[int, int, int]:
+    """Return semantic, most-derived, and recent observation budgets."""
+    semantic_observations = (
+        min(
+            max(
+                0,
+                semantic_search_top_k
+                if semantic_search_top_k is not None
+                else total // 3,
+            ),
+            total,
+        )
+        if include_semantic_query
+        else 0
+    )
+
+    if include_semantic_query and include_most_derived:
+        top_observations = min(max(0, total // 3), total - semantic_observations)
+    elif include_most_derived:
+        top_observations = min(max(0, total // 2), total - semantic_observations)
+    else:
+        top_observations = 0
+
+    recent_observations = total - semantic_observations - top_observations
+    return semantic_observations, top_observations, recent_observations
+
+
 def _observation_text(obs: ExplicitObservation | DeductiveObservation) -> str:
     """Return the canonical text payload for an explicit or deductive observation."""
     return obs.conclusion if isinstance(obs, DeductiveObservation) else obs.content
@@ -217,6 +250,8 @@ class RepresentationManager:
         embedding: list[float] | None = None,
         semantic_search_top_k: int | None = None,
         semantic_search_max_distance: float | None = None,
+        semantic_search_overfetch_k: int | None = None,
+        semantic_rerank: bool = False,
         include_most_derived: bool = False,
         max_observations: int = settings.DERIVER.WORKING_REPRESENTATION_MAX_OBSERVATIONS,
         parent_category: str | None = None,
@@ -233,6 +268,8 @@ class RepresentationManager:
             embedding: Pre-computed embedding for the semantic query.
             semantic_search_top_k: Number of semantic results
             semantic_search_max_distance: Maximum distance for semantic search
+            semantic_search_overfetch_k: Optional semantic vector candidate count before reranking
+            semantic_rerank: Whether to rerank semantic vector candidates
             include_most_derived: Include most derived observations
             max_observations: Maximum total observations to return
             parent_category: Optional workflow attribution forwarded to the
@@ -271,8 +308,33 @@ class RepresentationManager:
                 embedding=embedding,
                 semantic_search_top_k=semantic_search_top_k,
                 semantic_search_max_distance=semantic_search_max_distance,
+                semantic_search_overfetch_k=semantic_search_overfetch_k,
+                semantic_rerank=semantic_rerank,
                 include_most_derived=include_most_derived,
                 max_observations=max_observations,
+            )
+
+        precomputed_semantic_docs: list[models.Document] | None = None
+        if include_semantic_query and semantic_rerank:
+            semantic_observations, _, _ = _representation_counts(
+                total=max_observations,
+                include_semantic_query=include_semantic_query,
+                semantic_search_top_k=semantic_search_top_k,
+                include_most_derived=include_most_derived,
+            )
+            precomputed_semantic_docs = list(
+                await crud.query_documents(
+                    None,
+                    workspace_name=self.workspace_name,
+                    observer=self.observer,
+                    observed=self.observed,
+                    query=include_semantic_query,
+                    max_distance=semantic_search_max_distance,
+                    top_k=semantic_observations,
+                    embedding=embedding,
+                    overfetch_k=semantic_search_overfetch_k,
+                    rerank=True,
+                )
             )
 
         async with tracked_db(
@@ -285,8 +347,13 @@ class RepresentationManager:
                 embedding=embedding,
                 semantic_search_top_k=semantic_search_top_k,
                 semantic_search_max_distance=semantic_search_max_distance,
+                semantic_search_overfetch_k=semantic_search_overfetch_k,
+                semantic_rerank=False
+                if precomputed_semantic_docs is not None
+                else semantic_rerank,
                 include_most_derived=include_most_derived,
                 max_observations=max_observations,
+                precomputed_semantic_docs=precomputed_semantic_docs,
             )
 
     # Private helper methods
@@ -300,54 +367,40 @@ class RepresentationManager:
         embedding: list[float] | None = None,
         semantic_search_top_k: int | None = None,
         semantic_search_max_distance: float | None = None,
+        semantic_search_overfetch_k: int | None = None,
+        semantic_rerank: bool = False,
         include_most_derived: bool = False,
         max_observations: int = settings.DERIVER.WORKING_REPRESENTATION_MAX_OBSERVATIONS,
+        precomputed_semantic_docs: list[models.Document] | None = None,
     ) -> Representation:
         """Internal implementation of get_working_representation."""
         total = max_observations
-
-        # Calculate how many observations to get from each source
-        semantic_observations = (
-            min(
-                max(
-                    0,
-                    semantic_search_top_k
-                    if semantic_search_top_k is not None
-                    else total // 3,
-                ),
-                total,
+        semantic_observations, top_observations, recent_observations = (
+            _representation_counts(
+                total=total,
+                include_semantic_query=include_semantic_query,
+                semantic_search_top_k=semantic_search_top_k,
+                include_most_derived=include_most_derived,
             )
-            if include_semantic_query
-            else 0
         )
-
-        if include_semantic_query and include_most_derived:
-            # three-way blend: both semantic and derived requested
-            top_observations = min(max(0, total // 3), total - semantic_observations)
-        elif include_most_derived:
-            # two-way blend: only derived requested
-            top_observations = min(max(0, total // 2), total - semantic_observations)
-        else:
-            # no derived observations requested
-            top_observations = 0
-
-        # remaining observations are recent
-        recent_observations = total - semantic_observations - top_observations
 
         representation = Representation()
 
         # Get semantic observations if requested
-        if include_semantic_query:
+        semantic_docs: list[models.Document] = []
+        if precomputed_semantic_docs is not None:
+            semantic_docs = precomputed_semantic_docs
+        elif include_semantic_query:
             semantic_docs = await self._query_documents_semantic(
                 db,
                 query=include_semantic_query,
                 top_k=semantic_observations,
                 max_distance=semantic_search_max_distance,
                 embedding=embedding,
+                overfetch_k=semantic_search_overfetch_k,
+                rerank=semantic_rerank,
             )
-            representation.merge_representation(
-                Representation.from_documents(semantic_docs)
-            )
+        representation.merge_representation(Representation.from_documents(semantic_docs))
 
         # Get most derived observations if requested
         if include_most_derived:
@@ -375,6 +428,8 @@ class RepresentationManager:
         max_distance: float | None = None,
         level: str | None = None,
         embedding: list[float] | None = None,
+        overfetch_k: int | None = None,
+        rerank: bool = False,
     ) -> list[models.Document]:
         """Query documents by semantic similarity."""
         try:
@@ -386,6 +441,8 @@ class RepresentationManager:
                     top_k,
                     max_distance,
                     embedding=embedding,
+                    overfetch_k=overfetch_k,
+                    rerank=rerank,
                 )
             else:
                 documents = await crud.query_documents(
@@ -397,6 +454,8 @@ class RepresentationManager:
                     max_distance=max_distance,
                     top_k=top_k,
                     embedding=embedding,
+                    overfetch_k=overfetch_k,
+                    rerank=rerank,
                 )
                 db.expunge_all()
                 return list(documents)
@@ -473,6 +532,8 @@ class RepresentationManager:
         count: int,
         max_distance: float | None = None,
         embedding: list[float] | None = None,
+        overfetch_k: int | None = None,
+        rerank: bool = False,
     ) -> list[models.Document]:
         """Query documents for a specific level."""
         documents = await crud.query_documents(
@@ -485,6 +546,8 @@ class RepresentationManager:
             top_k=count,
             filters=self._build_filter_conditions(level),
             embedding=embedding,
+            overfetch_k=overfetch_k,
+            rerank=rerank,
         )
 
         # Sort by creation time
@@ -524,6 +587,8 @@ async def get_working_representation(
     embedding: list[float] | None = None,
     semantic_search_top_k: int | None = None,
     semantic_search_max_distance: float | None = None,
+    semantic_search_overfetch_k: int | None = None,
+    semantic_rerank: bool = False,
     include_most_derived: bool = False,
     max_observations: int = settings.DERIVER.WORKING_REPRESENTATION_MAX_OBSERVATIONS,
     parent_category: str | None = None,
@@ -557,6 +622,8 @@ async def get_working_representation(
         embedding=embedding,
         semantic_search_top_k=semantic_search_top_k,
         semantic_search_max_distance=semantic_search_max_distance,
+        semantic_search_overfetch_k=semantic_search_overfetch_k,
+        semantic_rerank=semantic_rerank,
         include_most_derived=include_most_derived,
         max_observations=max_observations,
         parent_category=parent_category,

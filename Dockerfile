@@ -17,18 +17,14 @@ ENV UV_LINK_MODE=copy
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Install the project's dependencies using the lockfile and settings
-RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=bind,source=uv.lock,target=uv.lock \
-    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-    uv sync --frozen --no-install-project --no-group dev
-
-# Copy only requirements to cache them in docker layer
+# Copy dependency manifests first so dependency install can be cached.
 COPY uv.lock pyproject.toml /app/
 
-# Sync the project
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-group dev
+# Install dependencies and then sync the project. This intentionally avoids
+# Dockerfile RUN --mount syntax because Grant's local Colima Docker CLI does not
+# currently expose BuildKit/buildx.
+RUN uv sync --frozen --no-install-project --no-group dev
+RUN uv sync --frozen --no-group dev
 
 # Place executables in the environment at the front of the path
 ENV PATH="/app/.venv/bin:$PATH"

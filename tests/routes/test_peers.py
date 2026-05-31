@@ -1,5 +1,6 @@
 import datetime
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -8,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src import crud, models
 from src.models import Peer, Workspace
+from src.utils.representation import Representation
 
 
 def test_get_or_create_peer(client: TestClient, sample_data: tuple[Workspace, Peer]):
@@ -920,6 +922,113 @@ def test_get_peer_representation_default_max_observations(
     data = response.json()
     assert "representation" in data
 
+
+
+def test_get_peer_context_search_query_defaults_to_focused_reranked_context(
+    client: TestClient, sample_data: tuple[Workspace, Peer]
+):
+    """Query-scoped peer context should default to semantic-only reranked focus."""
+    test_workspace, test_peer = sample_data
+
+    with (
+        patch(
+            "src.routers.peers.embedding_client.embed",
+            new=AsyncMock(return_value=[0.1, 0.2, 0.3]),
+        ),
+        patch(
+            "src.routers.peers.crud.get_working_representation",
+            new=AsyncMock(return_value=Representation()),
+        ) as mock_get_representation,
+        patch(
+            "src.routers.peers.crud.get_peer_card",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
+        response = client.get(
+            f"/v3/workspaces/{test_workspace.name}/peers/{test_peer.name}/context",
+            params={"search_query": "honcho retrieval quality"},
+        )
+
+    assert response.status_code == 200
+    call = mock_get_representation.await_args
+    assert call is not None
+    assert call.kwargs["include_semantic_query"] == "honcho retrieval quality"
+    assert call.kwargs["include_most_derived"] is False
+    assert call.kwargs["semantic_search_top_k"] == 12
+    assert call.kwargs["max_observations"] == 12
+    assert call.kwargs["semantic_search_overfetch_k"] == 75
+    assert call.kwargs["semantic_rerank"] is True
+
+
+def test_get_peer_context_without_search_query_keeps_broad_defaults(
+    client: TestClient, sample_data: tuple[Workspace, Peer]
+):
+    """Broad peer context should keep existing most-frequent/recent behavior."""
+    test_workspace, test_peer = sample_data
+
+    with (
+        patch(
+            "src.routers.peers.crud.get_working_representation",
+            new=AsyncMock(return_value=Representation()),
+        ) as mock_get_representation,
+        patch(
+            "src.routers.peers.crud.get_peer_card",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
+        response = client.get(
+            f"/v3/workspaces/{test_workspace.name}/peers/{test_peer.name}/context"
+        )
+
+    assert response.status_code == 200
+    call = mock_get_representation.await_args
+    assert call is not None
+    assert call.kwargs["include_semantic_query"] is None
+    assert call.kwargs["include_most_derived"] is True
+    assert call.kwargs["semantic_search_top_k"] is None
+    assert call.kwargs["max_observations"] == 25
+    assert call.kwargs["semantic_search_overfetch_k"] is None
+    assert call.kwargs["semantic_rerank"] is False
+
+
+def test_get_peer_context_search_query_honors_explicit_blended_options(
+    client: TestClient, sample_data: tuple[Workspace, Peer]
+):
+    """Explicit include_most_frequent/search_top_k/max_conclusions override focused defaults."""
+    test_workspace, test_peer = sample_data
+
+    with (
+        patch(
+            "src.routers.peers.embedding_client.embed",
+            new=AsyncMock(return_value=[0.1, 0.2, 0.3]),
+        ),
+        patch(
+            "src.routers.peers.crud.get_working_representation",
+            new=AsyncMock(return_value=Representation()),
+        ) as mock_get_representation,
+        patch(
+            "src.routers.peers.crud.get_peer_card",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
+        response = client.get(
+            f"/v3/workspaces/{test_workspace.name}/peers/{test_peer.name}/context",
+            params={
+                "search_query": "honcho retrieval quality",
+                "include_most_frequent": True,
+                "search_top_k": 30,
+                "max_conclusions": 100,
+            },
+        )
+
+    assert response.status_code == 200
+    call = mock_get_representation.await_args
+    assert call is not None
+    assert call.kwargs["include_most_derived"] is True
+    assert call.kwargs["semantic_search_top_k"] == 30
+    assert call.kwargs["max_observations"] == 100
+    assert call.kwargs["semantic_search_overfetch_k"] == 75
+    assert call.kwargs["semantic_rerank"] is True
 
 def test_search_peer(client: TestClient, sample_data: tuple[Workspace, Peer]):
     """Test the peer search functionality"""

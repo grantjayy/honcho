@@ -322,6 +322,17 @@ class OpenAIBackend:
             ):
                 if key in extra_params:
                     params[key] = extra_params[key]
+
+            # OpenAI-compatible relays such as OpenRouter accept additional
+            # JSON-body fields (for example: {"provider": {"order": [...]}})
+            # via the OpenAI SDK's extra_body escape hatch. Honcho's
+            # provider_params is intentionally free-form, so preserve that
+            # flexibility instead of silently dropping unknown keys here.
+            extra_body = extra_params.get("extra_body")
+            if isinstance(extra_body, dict):
+                params.setdefault("extra_body", {}).update(extra_body)
+            if "provider" in extra_params:
+                params.setdefault("extra_body", {})["provider"] = extra_params["provider"]
         return params
 
     def _normalize_response(

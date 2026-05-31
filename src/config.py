@@ -23,8 +23,10 @@ if not os.getenv("PYTHON_DOTENV_DISABLED"):
 logger = logging.getLogger(__name__)
 
 ModelTransport = Literal["anthropic", "openai", "gemini"]
-EmbeddingTransport = Literal["openai", "gemini"]
+EmbeddingTransport = Literal["openai", "gemini", "voyage"]
 EmbeddingDimensionsMode = Literal["auto", "always", "never"]
+EmbeddingInputType = Literal["query", "document", None]
+EmbeddingOutputDtype = Literal["float", "int8", "uint8", "binary", "ubinary"]
 
 # OpenAI-compatible models that reject the `dimensions=` request parameter.
 _EMBEDDING_KNOWN_REJECTING_MODELS: frozenset[str] = frozenset(
@@ -35,6 +37,8 @@ _EMBEDDING_KNOWN_REJECTING_MODELS: frozenset[str] = frozenset(
 def _default_embedding_model_for_transport(transport: EmbeddingTransport) -> str:
     if transport == "gemini":
         return "gemini-embedding-001"
+    if transport == "voyage":
+        return "voyage-4-large"
     return "text-embedding-3-small"
 
 
@@ -301,6 +305,9 @@ class ConfiguredEmbeddingModelSettings(BaseModel):
     transport: EmbeddingTransport = "openai"
     overrides: ModelOverrideSettings = Field(default_factory=ModelOverrideSettings)
     dimensions_mode: EmbeddingDimensionsMode = "auto"
+    query_input_type: EmbeddingInputType = "query"
+    document_input_type: EmbeddingInputType = "document"
+    output_dtype: EmbeddingOutputDtype = "float"
 
     @model_validator(mode="before")
     @classmethod
@@ -318,7 +325,7 @@ class ConfiguredEmbeddingModelSettings(BaseModel):
             and transport_value is None
         ):
             prefix, bare_model = model_value.split("/", 1)
-            if prefix in {"openai", "gemini"}:
+            if prefix in {"openai", "gemini", "voyage"}:
                 update["transport"] = prefix
                 update["model"] = bare_model
         return update
@@ -337,6 +344,9 @@ class EmbeddingModelConfig(BaseModel):
     transport: EmbeddingTransport = "openai"
     api_key: str | None = None
     base_url: str | None = None
+    query_input_type: EmbeddingInputType = "query"
+    document_input_type: EmbeddingInputType = "document"
+    output_dtype: EmbeddingOutputDtype = "float"
 
     @model_validator(mode="before")
     @classmethod
@@ -354,7 +364,7 @@ class EmbeddingModelConfig(BaseModel):
             and transport_value is None
         ):
             prefix, bare_model = model_value.split("/", 1)
-            if prefix in {"openai", "gemini"}:
+            if prefix in {"openai", "gemini", "voyage"}:
                 update["transport"] = prefix
                 update["model"] = bare_model
         return update
@@ -440,6 +450,8 @@ def _default_embedding_api_key(transport: EmbeddingTransport) -> str | None:
         return settings.LLM.OPENAI_API_KEY
     if transport == "gemini":
         return settings.LLM.GEMINI_API_KEY
+    if transport == "voyage":
+        return os.getenv("VOYAGE_AI_API_KEY") or os.getenv("VOYAGE_API_KEY")
 
 
 def resolve_embedding_model_config(
@@ -459,6 +471,9 @@ def resolve_embedding_model_config(
         transport=configured.transport,
         api_key=api_key,
         base_url=configured.overrides.base_url,
+        query_input_type=configured.query_input_type,
+        document_input_type=configured.document_input_type,
+        output_dtype=configured.output_dtype,
     )
 
 

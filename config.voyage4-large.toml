@@ -1,0 +1,24 @@
+# Honcho Voyage 4 Large embedding configuration profile.
+# This is intentionally not the live config.toml yet: the current pgvector
+# columns are vector(1536) and contain OpenAI text-embedding-3-large vectors.
+# Cut over only after migrating/rebuilding embeddings at vector(1024).
+
+[embedding]
+VECTOR_DIMENSIONS = 1024
+MAX_INPUT_TOKENS = 32000
+MAX_TOKENS_PER_REQUEST = 120000
+
+[embedding.model_config]
+transport = "voyage"
+model = "voyage-4-large"
+# Voyage 4 Large default output dimension is 1024. Honcho still stores the
+# expected dimension in VECTOR_DIMENSIONS so pgvector schema validation can
+# enforce that the DB and provider agree.
+dimensions_mode = "never"
+query_input_type = "query"
+document_input_type = "document"
+output_dtype = "float"
+
+[embedding.model_config.overrides]
+api_key_env = "VOYAGE_AI_API_KEY"
+base_url = "https://api.voyageai.com/v1"

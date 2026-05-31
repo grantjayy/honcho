@@ -23,6 +23,7 @@ from src.exceptions import (
     VectorStoreError,
 )
 from src.utils.filter import apply_filter
+from src.utils.rerank import rerank_texts
 from src.vector_store import (
     VectorRecord,
     VectorStore,
@@ -324,6 +325,8 @@ async def query_documents(
     max_distance: float | None = None,
     top_k: int = 5,
     embedding: list[float] | None = None,
+    overfetch_k: int | None = None,
+    rerank: bool = False,
 ) -> Sequence[models.Document]:
     """
     Query documents using semantic similarity.
@@ -342,10 +345,17 @@ async def query_documents(
         max_distance: Maximum cosine distance for results
         top_k: Number of results to return
         embedding: Optional pre-computed embedding for the query (avoids extra API call if possible)
+        overfetch_k: Optional vector candidate count before truncating/reranking
+        rerank: Whether to rerank vector candidates with the rerank provider
 
     Returns:
         Sequence of matching documents
     """
+    if top_k <= 0:
+        return []
+
+    candidate_k = max(top_k, overfetch_k or top_k)
+
     # Use provided embedding or generate one
     if embedding is None:
         try:
@@ -359,7 +369,7 @@ async def query_documents(
     if _uses_pgvector():
         # pgvector path — pure DB, open a short session if none provided
         if db is not None:
-            return await _query_documents_pgvector(
+            docs = await _query_documents_pgvector(
                 db,
                 workspace_name,
                 observer,
@@ -367,8 +377,9 @@ async def query_documents(
                 embedding,
                 filters,
                 max_distance,
-                top_k,
+                candidate_k,
             )
+            return list(docs)[:top_k]
         async with tracked_db("query_documents.pgvector") as managed_db:
             docs = await _query_documents_pgvector(
                 managed_db,
@@ -378,11 +389,13 @@ async def query_documents(
                 embedding,
                 filters,
                 max_distance,
-                top_k,
+                candidate_k,
             )
             for doc in docs:
                 managed_db.expunge(doc)
-            return docs
+        return await _maybe_rerank_documents(
+            query=query, documents=docs, top_k=top_k, rerank=rerank
+        )
 
     # External vector store — network call first, DB only for the ID fetch
     document_ids = await query_external_vector_document_ids(
@@ -390,7 +403,7 @@ async def query_documents(
         observer=observer,
         observed=observed,
         embedding=embedding,
-        top_k=top_k,
+        top_k=candidate_k,
         max_distance=max_distance,
         filters=filters,
     )
@@ -399,7 +412,7 @@ async def query_documents(
         return []
 
     if db is not None:
-        return await fetch_documents_by_ids(
+        docs = await fetch_documents_by_ids(
             db=db,
             workspace_name=workspace_name,
             observer=observer,
@@ -407,6 +420,7 @@ async def query_documents(
             document_ids=document_ids,
             filters=filters,
         )
+        return list(docs)[:top_k]
     async with tracked_db("query_documents.fetch") as managed_db:
         docs = await fetch_documents_by_ids(
             db=managed_db,
@@ -418,7 +432,45 @@ async def query_documents(
         )
         for doc in docs:
             managed_db.expunge(doc)
-        return docs
+    return await _maybe_rerank_documents(
+        query=query, documents=list(docs), top_k=top_k, rerank=rerank
+    )
+
+
+async def _maybe_rerank_documents(
+    *,
+    query: str,
+    documents: Sequence[models.Document],
+    top_k: int,
+    rerank: bool,
+) -> list[models.Document]:
+    """Apply best-effort reranking and fall back to vector order."""
+    docs = list(documents)
+    if not rerank or len(docs) <= 1:
+        return docs[:top_k]
+
+    ranked = await rerank_texts(
+        query=query,
+        documents=[doc.content for doc in docs],
+        top_k=top_k,
+    )
+    if not ranked:
+        return docs[:top_k]
+
+    seen: set[int] = set()
+    reranked_docs: list[models.Document] = []
+    for result in ranked:
+        if result.index in seen:
+            continue
+        seen.add(result.index)
+        reranked_docs.append(docs[result.index])
+
+    if len(reranked_docs) < top_k:
+        reranked_docs.extend(
+            doc for index, doc in enumerate(docs) if index not in seen
+        )
+
+    return reranked_docs[:top_k]
 
 
 async def create_documents(

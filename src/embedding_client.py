@@ -4,8 +4,9 @@ import threading
 import time
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
-from typing import Any, Literal, NamedTuple, TypeVar
+from typing import Any, Literal, NamedTuple, TypeVar, cast
 
+import httpx
 import tiktoken
 from google import genai
 from google.genai import types as genai_types
@@ -136,7 +137,7 @@ class BatchItem(NamedTuple):
 
 class _EmbeddingClient:
     """
-    Embedding client supporting OpenAI and Gemini with chunking and batching support.
+    Embedding client supporting OpenAI, Gemini, and Voyage with chunking and batching support.
     """
 
     def __init__(
@@ -153,6 +154,10 @@ class _EmbeddingClient:
         self.vector_dimensions: int = vector_dimensions
         self.send_dimensions: bool = send_dimensions
 
+        self.query_input_type = config.query_input_type
+        self.document_input_type = config.document_input_type
+        self.output_dtype = config.output_dtype
+
         if self.transport == "gemini":
             if not config.api_key:
                 raise ValueError("Gemini API key is required")
@@ -161,7 +166,7 @@ class _EmbeddingClient:
                 if config.base_url
                 else None
             )
-            self.client: genai.Client | AsyncOpenAI = genai.Client(
+            self.client: genai.Client | AsyncOpenAI | httpx.AsyncClient = genai.Client(
                 api_key=config.api_key,
                 http_options=http_options,
             )
@@ -169,6 +174,23 @@ class _EmbeddingClient:
             self.max_embedding_tokens: int = min(max_input_tokens, 2048)
             # Gemini batch size is not documented, using conservative estimate
             self.max_batch_size: int = 100
+        elif self.transport == "voyage":
+            if not config.api_key:
+                raise ValueError("Voyage API key is required")
+            self.client = httpx.AsyncClient(
+                base_url=config.base_url or "https://api.voyageai.com/v1",
+                headers={"Authorization": f"Bearer {config.api_key}"},
+                timeout=60.0,
+            )
+            # Voyage 4 models support 32K-token inputs. Voyage caps the number
+            # of texts per embeddings request at 1,000 and has per-request
+            # token ceilings by model; keep the default conservative for
+            # voyage-4-large, which is the production target here.
+            self.max_embedding_tokens = min(max_input_tokens, 32_000)
+            self.max_batch_size = 1000
+            self.max_embedding_tokens_per_request = min(
+                max_tokens_per_request, 120_000
+            )
         else:  # openai
             if not config.api_key:
                 raise ValueError("OpenAI API key is required")
@@ -183,7 +205,8 @@ class _EmbeddingClient:
             self.encoding: tiktoken.Encoding = tiktoken.encoding_for_model(self.model)
         except KeyError:
             self.encoding = tiktoken.get_encoding("cl100k_base")
-        self.max_embedding_tokens_per_request: int = max_tokens_per_request
+        if self.transport != "voyage":
+            self.max_embedding_tokens_per_request: int = max_tokens_per_request
 
     @property
     def provider(self) -> str:
@@ -197,6 +220,41 @@ class _EmbeddingClient:
             )
         return embedding
 
+    async def _voyage_embeddings(
+        self, texts: list[str], *, input_type: str | None
+    ) -> list[list[float]]:
+        if not isinstance(self.client, httpx.AsyncClient):
+            raise TypeError("Voyage transport requires an httpx.AsyncClient")
+
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "input": texts,
+            "output_dtype": self.output_dtype,
+        }
+        if self.send_dimensions:
+            payload["output_dimension"] = self.vector_dimensions
+        if input_type is not None:
+            payload["input_type"] = input_type
+
+        response = await self.client.post("/embeddings", json=payload)
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise ValueError(
+                f"Voyage embeddings request failed: {exc.response.text}"
+            ) from exc
+
+        data = response.json().get("data") or []
+        indexed = sorted(data, key=lambda item: int(item.get("index", 0)))
+        embeddings = [
+            self._validate_embedding_dimensions(item["embedding"]) for item in indexed
+        ]
+        if len(embeddings) != len(texts):
+            raise ValueError(
+                f"Voyage returned {len(embeddings)} embeddings for {len(texts)} inputs"
+            )
+        return embeddings
+
     async def embed(self, query: str) -> list[float]:
         token_count = len(self.encoding.encode(query))
 
@@ -208,8 +266,8 @@ class _EmbeddingClient:
         # Bind the typed client at the dispatch site so pyright can narrow it
         # for the closures without needing `assert isinstance(...)` (bandit
         # B101). The closures close over the narrowed local, not `self.client`.
-        if isinstance(self.client, genai.Client):
-            gemini_client = self.client
+        if self.transport == "gemini":
+            gemini_client = cast(genai.Client, self.client)
 
             async def _call_gemini() -> list[float]:
                 response = await gemini_client.aio.models.embed_content(
@@ -231,7 +289,24 @@ class _EmbeddingClient:
                 fn=_call_gemini,
             )
 
-        openai_client = self.client
+        if self.transport == "voyage":
+
+            async def _call_voyage() -> list[float]:
+                return (
+                    await self._voyage_embeddings(
+                        [query], input_type=self.query_input_type
+                    )
+                )[0]
+
+            return await _emit_embedding_call(
+                provider=self.transport,
+                model=self.model,
+                texts=[query],
+                input_tokens_estimate=token_count,
+                fn=_call_voyage,
+            )
+
+        openai_client = cast(AsyncOpenAI, self.client)
 
         async def _call_openai() -> list[float]:
             openai_kwargs: dict[str, Any] = {"model": self.model, "input": [query]}
@@ -270,9 +345,10 @@ class _EmbeddingClient:
                 """One provider call for one batch. Lifted into a closure so
                 _emit_embedding_call can time + emit + propagate errors."""
                 batch_embeddings: list[list[float]] = []
-                if isinstance(self.client, genai.Client):
+                if self.transport == "gemini":
+                    gemini_client = cast(genai.Client, self.client)
                     # Type cast needed due to genai type signature complexity
-                    response = await self.client.aio.models.embed_content(
+                    response = await gemini_client.aio.models.embed_content(
                         model=self.model,
                         contents=batch,  # pyright: ignore[reportArgumentType]
                         config={"output_dimensionality": self.vector_dimensions},
@@ -283,6 +359,12 @@ class _EmbeddingClient:
                                 batch_embeddings.append(
                                     self._validate_embedding_dimensions(emb.values)
                                 )
+                elif self.transport == "voyage":
+                    batch_embeddings.extend(
+                        await self._voyage_embeddings(
+                            batch, input_type=self.document_input_type
+                        )
+                    )
                 else:  # openai
                     openai_kwargs: dict[str, Any] = {
                         "input": batch,
@@ -290,7 +372,8 @@ class _EmbeddingClient:
                     }
                     if self.send_dimensions:
                         openai_kwargs["dimensions"] = self.vector_dimensions
-                    response = await self.client.embeddings.create(**openai_kwargs)
+                    openai_client = cast(AsyncOpenAI, self.client)
+                    response = await openai_client.embeddings.create(**openai_kwargs)
                     batch_embeddings.extend(
                         [
                             self._validate_embedding_dimensions(data.embedding)
@@ -436,8 +519,9 @@ class _EmbeddingClient:
             attempt is a distinct provider hit and shows up as its own line
             item in analytics."""
             result: dict[str, dict[int, list[float]]] = defaultdict(dict)
-            if isinstance(self.client, genai.Client):
-                response = await self.client.aio.models.embed_content(
+            if self.transport == "gemini":
+                gemini_client = cast(genai.Client, self.client)
+                response = await gemini_client.aio.models.embed_content(
                     model=self.model,
                     contents=[item.text for item in batch],
                     config={"output_dimensionality": self.vector_dimensions},
@@ -448,6 +532,13 @@ class _EmbeddingClient:
                             result[item.text_id][item.chunk_index] = (
                                 self._validate_embedding_dimensions(embedding.values)
                             )
+            elif self.transport == "voyage":
+                embeddings = await self._voyage_embeddings(
+                    [item.text for item in batch],
+                    input_type=self.document_input_type,
+                )
+                for item, embedding in zip(batch, embeddings, strict=True):
+                    result[item.text_id][item.chunk_index] = embedding
             else:  # openai
                 openai_kwargs: dict[str, Any] = {
                     "model": self.model,
@@ -455,7 +546,8 @@ class _EmbeddingClient:
                 }
                 if self.send_dimensions:
                     openai_kwargs["dimensions"] = self.vector_dimensions
-                response = await self.client.embeddings.create(**openai_kwargs)
+                openai_client = cast(AsyncOpenAI, self.client)
+                response = await openai_client.embeddings.create(**openai_kwargs)
                 for item, embedding_data in zip(batch, response.data, strict=True):
                     result[item.text_id][item.chunk_index] = (
                         self._validate_embedding_dimensions(embedding_data.embedding)
@@ -612,6 +704,9 @@ class EmbeddingClient:
             runtime_config.model,
             runtime_config.api_key,
             runtime_config.base_url,
+            runtime_config.query_input_type,
+            runtime_config.document_input_type,
+            runtime_config.output_dtype,
             settings.EMBEDDING.VECTOR_DIMENSIONS,
             settings.EMBEDDING.MAX_INPUT_TOKENS,
             settings.EMBEDDING.MAX_TOKENS_PER_REQUEST,

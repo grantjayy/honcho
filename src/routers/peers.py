@@ -26,6 +26,10 @@ from src.utils.types import embedding_call_purpose
 
 logger = logging.getLogger(__name__)
 
+FOCUSED_CONTEXT_TOP_K = 12
+FOCUSED_CONTEXT_MAX_CONCLUSIONS = 12
+FOCUSED_CONTEXT_OVERFETCH_K = 75
+
 router = APIRouter(
     prefix="/workspaces/{workspace_id}/peers",
     tags=["peers"],
@@ -402,9 +406,13 @@ async def get_peer_context(
         le=1.0,
         description="Only used if `search_query` is provided. Maximum distance for semantically relevant conclusions",
     ),
-    include_most_frequent: bool = Query(
-        default=True,
-        description="Whether to include the most frequent conclusions in the representation",
+    include_most_frequent: bool | None = Query(
+        default=None,
+        description=(
+            "Whether to include the most frequent conclusions in the representation. "
+            "When omitted, defaults to false for search_query requests and true "
+            "for broad context."
+        ),
     ),
     max_conclusions: int | None = Query(
         None,
@@ -428,6 +436,27 @@ async def get_peer_context(
     # If no target specified, get the peer's own context (self-observation)
     observed = target if target is not None else peer_id
     context_started = perf_counter()
+    focused_query = bool(search_query)
+    effective_include_most_frequent = (
+        include_most_frequent
+        if include_most_frequent is not None
+        else not focused_query
+    )
+    effective_search_top_k = (
+        search_top_k
+        if search_top_k is not None
+        else FOCUSED_CONTEXT_TOP_K
+        if focused_query
+        else None
+    )
+    effective_max_conclusions = (
+        max_conclusions
+        if max_conclusions is not None
+        else FOCUSED_CONTEXT_MAX_CONCLUSIONS
+        if focused_query
+        else settings.DERIVER.WORKING_REPRESENTATION_MAX_OBSERVATIONS
+    )
+    effective_overfetch_k = FOCUSED_CONTEXT_OVERFETCH_K if focused_query else None
 
     try:
         embedding: list[float] | None = None
@@ -450,12 +479,12 @@ async def get_peer_context(
             session_name=None,  # Peer context is global, not session-scoped
             include_semantic_query=search_query,
             embedding=embedding,
-            semantic_search_top_k=search_top_k,
+            semantic_search_top_k=effective_search_top_k,
             semantic_search_max_distance=search_max_distance,
-            include_most_derived=include_most_frequent,
-            max_observations=max_conclusions
-            if max_conclusions is not None
-            else settings.DERIVER.WORKING_REPRESENTATION_MAX_OBSERVATIONS,
+            semantic_search_overfetch_k=effective_overfetch_k,
+            semantic_rerank=focused_query,
+            include_most_derived=effective_include_most_frequent,
+            max_observations=effective_max_conclusions,
             parent_category="api",
         )
 
@@ -481,7 +510,7 @@ async def get_peer_context(
                 search_query_provided=search_query is not None,
                 search_top_k=search_top_k,
                 search_max_distance=search_max_distance,
-                include_most_frequent=include_most_frequent,
+                include_most_frequent=effective_include_most_frequent,
                 max_conclusions=max_conclusions,
                 total_duration_ms=(perf_counter() - context_started) * 1000,
             )
