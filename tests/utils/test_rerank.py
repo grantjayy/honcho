@@ -3,7 +3,7 @@ from unittest.mock import Mock
 import httpx
 import pytest
 
-from src.utils.rerank import rerank_texts
+from src.utils.rerank import DEFAULT_RERANK_MODEL, rerank_texts
 
 
 @pytest.mark.asyncio
@@ -95,7 +95,6 @@ async def test_rerank_texts_parses_voyage_ranking(monkeypatch):
         query="honcho retrieval",
         documents=["a", "b", "c"],
         top_k=2,
-        model="rerank-2.5-lite",
         timeout=3.0,
     )
 
@@ -103,6 +102,7 @@ async def test_rerank_texts_parses_voyage_ranking(monkeypatch):
     assert [result.index for result in results] == [2, 0]
     assert [result.relevance_score for result in results] == [0.99, 0.55]
     post_call = next(call for call in calls if call[0] == "post")
-    assert post_call[2]["json"]["model"] == "rerank-2.5-lite"
+    assert DEFAULT_RERANK_MODEL == "rerank-2.5"
+    assert post_call[2]["json"]["model"] == "rerank-2.5"
     assert post_call[2]["json"]["top_k"] == 2
     assert post_call[2]["headers"]["Authorization"] == "Bearer test-key"

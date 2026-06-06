@@ -10,7 +10,7 @@ import httpx
 logger = getLogger(__name__)
 
 VOYAGE_RERANK_URL = "https://api.voyageai.com/v1/rerank"
-DEFAULT_RERANK_MODEL = "rerank-2.5-lite"
+DEFAULT_RERANK_MODEL = "rerank-2.5"
 DEFAULT_RERANK_TIMEOUT_SECONDS = 3.0
 
 
