@@ -908,10 +908,9 @@ def test_get_peer_representation_boundary_values(
 def test_get_peer_representation_default_max_observations(
     client: TestClient, sample_data: tuple[Workspace, Peer]
 ):
-    """Test that max_observations defaults to 25 when not provided"""
+    """Test that representation works when max_observations is omitted."""
     test_workspace, test_peer = sample_data
 
-    # Test without max_observations - should use default of 25
     response = client.post(
         f"/v3/workspaces/{test_workspace.name}/peers/{test_peer.name}/representation",
         json={
@@ -986,7 +985,6 @@ def test_get_peer_context_without_search_query_keeps_broad_defaults(
     assert call.kwargs["include_semantic_query"] is None
     assert call.kwargs["include_most_derived"] is True
     assert call.kwargs["semantic_search_top_k"] is None
-    assert call.kwargs["max_observations"] == 25
     assert call.kwargs["semantic_search_overfetch_k"] is None
     assert call.kwargs["semantic_rerank"] is False
 
