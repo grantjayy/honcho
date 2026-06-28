@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from src.config import ConfiguredEmbeddingModelSettings, EmbeddingModelConfig
-from src.embedding_client import _EmbeddingClient
+from src.embedding_client import _EmbeddingClient  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio

@@ -12,7 +12,13 @@ from google import genai
 from google.genai import types as genai_types
 from openai import AsyncOpenAI
 
-from .config import EmbeddingModelConfig, resolve_embedding_model_config, settings
+from .config import (
+    EmbeddingInputType,
+    EmbeddingModelConfig,
+    EmbeddingOutputDtype,
+    resolve_embedding_model_config,
+    settings,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +30,15 @@ def _embedding_encoding_for_model(model: str) -> tiktoken.Encoding:
         return tiktoken.encoding_for_model(model)
     except KeyError:
         return tiktoken.get_encoding("cl100k_base")
+
+def _mapping_value(mapping: dict[str, object], key: str) -> object:
+    return mapping.get(key)
+
+def _embedding_response_index(item: dict[str, object]) -> int:
+    index = item.get("index")
+    return index if isinstance(index, int) else 0
+
+
 
 
 def get_embedding_encoding() -> tiktoken.Encoding:
@@ -167,9 +182,9 @@ class _EmbeddingClient:
         self.vector_dimensions: int = vector_dimensions
         self.send_dimensions: bool = send_dimensions
 
-        self.query_input_type = config.query_input_type
-        self.document_input_type = config.document_input_type
-        self.output_dtype = config.output_dtype
+        self.query_input_type: EmbeddingInputType = config.query_input_type
+        self.document_input_type: EmbeddingInputType = config.document_input_type
+        self.output_dtype: EmbeddingOutputDtype = config.output_dtype
 
         if self.transport == "gemini":
             if not config.api_key:
@@ -214,7 +229,7 @@ class _EmbeddingClient:
             self.max_embedding_tokens = max_input_tokens
             self.max_batch_size = 2048  # OpenAI batch limit
 
-        self.encoding = _embedding_encoding_for_model(self.model)
+        self.encoding: tiktoken.Encoding = _embedding_encoding_for_model(self.model)
         if self.transport != "voyage":
             self.max_embedding_tokens_per_request: int = max_tokens_per_request
 
@@ -254,10 +269,17 @@ class _EmbeddingClient:
                 f"Voyage embeddings request failed: {exc.response.text}"
             ) from exc
 
-        data = response.json().get("data") or []
-        indexed = sorted(data, key=lambda item: int(item.get("index", 0)))
+        payload_json = response.json()
+        payload_data: object = (
+            _mapping_value(cast(dict[str, object], payload_json), "data")
+            if isinstance(payload_json, dict)
+            else None
+        )
+        data = cast(list[dict[str, object]], payload_data) if isinstance(payload_data, list) else []
+        indexed: list[dict[str, object]] = sorted(data, key=_embedding_response_index)
         embeddings = [
-            self._validate_embedding_dimensions(item["embedding"]) for item in indexed
+            self._validate_embedding_dimensions(cast(list[float], item["embedding"]))
+            for item in indexed
         ]
         if len(embeddings) != len(texts):
             raise ValueError(

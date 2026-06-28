@@ -4,6 +4,7 @@ import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from logging import getLogger
+from typing import cast
 
 import httpx
 
@@ -55,23 +56,27 @@ async def rerank_texts(
                 },
             )
             response.raise_for_status()
-            payload = response.json()
+            payload: object = response.json()
     except Exception as exc:
         logger.info("Voyage rerank unavailable; falling back to vector order: %s", exc)
         return None
 
-    results = payload.get("data") if isinstance(payload, dict) else None
-    if not isinstance(results, list):
+    results_obj: object = (
+        cast(dict[str, object], payload).get("data") if isinstance(payload, dict) else None
+    )
+    if not isinstance(results_obj, list):
         return None
+    results = cast(list[object], results_obj)
 
     parsed: list[RerankResult] = []
     for item in results:
         if not isinstance(item, dict):
             continue
-        idx = item.get("index")
+        typed_item = cast(dict[str, object], item)
+        idx = typed_item.get("index")
         if not isinstance(idx, int) or idx < 0 or idx >= len(documents):
             continue
-        score = item.get("relevance_score")
+        score = typed_item.get("relevance_score")
         parsed.append(
             RerankResult(
                 index=idx,
