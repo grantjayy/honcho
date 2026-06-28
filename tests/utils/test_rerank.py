@@ -1,4 +1,7 @@
-from unittest.mock import Mock
+from __future__ import annotations
+
+from types import TracebackType
+from typing import cast
 
 import httpx
 import pytest
@@ -6,8 +9,18 @@ import pytest
 from src.utils.rerank import DEFAULT_RERANK_MODEL, rerank_texts
 
 
+def _rerank_response(json_body: dict[str, object]) -> httpx.Response:
+    return httpx.Response(
+        200,
+        json=json_body,
+        request=httpx.Request("POST", "https://api.voyageai.com/v1/rerank"),
+    )
+
+
 @pytest.mark.asyncio
-async def test_rerank_texts_returns_none_without_api_key(monkeypatch):
+async def test_rerank_texts_returns_none_without_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
     monkeypatch.delenv("VOYAGE_AI_API_KEY", raising=False)
     monkeypatch.delenv("RERANK_API_KEY", raising=False)
@@ -16,20 +29,27 @@ async def test_rerank_texts_returns_none_without_api_key(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_rerank_texts_returns_none_on_http_error(monkeypatch):
+async def test_rerank_texts_returns_none_on_http_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
 
     class FailingClient:
-        def __init__(self, *args, **kwargs):
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
             pass
 
-        async def __aenter__(self):
+        async def __aenter__(self) -> FailingClient:
             return self
 
-        async def __aexit__(self, exc_type, exc, tb):
+        async def __aexit__(
+            self,
+            _exc_type: type[BaseException] | None,
+            _exc: BaseException | None,
+            _tb: TracebackType | None,
+        ) -> bool:
             return False
 
-        async def post(self, *args, **kwargs):
+        async def post(self, *_args: object, **_kwargs: object) -> httpx.Response:
             raise httpx.TimeoutException("slow")
 
     monkeypatch.setattr(httpx, "AsyncClient", FailingClient)
@@ -38,23 +58,28 @@ async def test_rerank_texts_returns_none_on_http_error(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_rerank_texts_returns_none_on_malformed_response(monkeypatch):
+async def test_rerank_texts_returns_none_on_malformed_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
-    response = Mock()
-    response.raise_for_status.return_value = None
-    response.json.return_value = {"unexpected": []}
+    response = _rerank_response({"unexpected": []})
 
     class FakeClient:
-        def __init__(self, *args, **kwargs):
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
             pass
 
-        async def __aenter__(self):
+        async def __aenter__(self) -> FakeClient:
             return self
 
-        async def __aexit__(self, exc_type, exc, tb):
+        async def __aexit__(
+            self,
+            _exc_type: type[BaseException] | None,
+            _exc: BaseException | None,
+            _tb: TracebackType | None,
+        ) -> bool:
             return False
 
-        async def post(self, *args, **kwargs):
+        async def post(self, *_args: object, **_kwargs: object) -> httpx.Response:
             return response
 
     monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
@@ -63,29 +88,36 @@ async def test_rerank_texts_returns_none_on_malformed_response(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_rerank_texts_parses_voyage_ranking(monkeypatch):
+async def test_rerank_texts_parses_voyage_ranking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
-    calls = []
-    response = Mock()
-    response.raise_for_status.return_value = None
-    response.json.return_value = {
-        "data": [
-            {"index": 2, "relevance_score": 0.99},
-            {"index": 0, "relevance_score": 0.55},
-        ]
-    }
+    calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+    response = _rerank_response(
+        {
+            "data": [
+                {"index": 2, "relevance_score": 0.99},
+                {"index": 0, "relevance_score": 0.55},
+            ]
+        }
+    )
 
     class FakeClient:
-        def __init__(self, *args, **kwargs):
+        def __init__(self, *args: object, **kwargs: object) -> None:
             calls.append(("init", args, kwargs))
 
-        async def __aenter__(self):
+        async def __aenter__(self) -> FakeClient:
             return self
 
-        async def __aexit__(self, exc_type, exc, tb):
+        async def __aexit__(
+            self,
+            _exc_type: type[BaseException] | None,
+            _exc: BaseException | None,
+            _tb: TracebackType | None,
+        ) -> bool:
             return False
 
-        async def post(self, *args, **kwargs):
+        async def post(self, *args: object, **kwargs: object) -> httpx.Response:
             calls.append(("post", args, kwargs))
             return response
 
@@ -102,7 +134,9 @@ async def test_rerank_texts_parses_voyage_ranking(monkeypatch):
     assert [result.index for result in results] == [2, 0]
     assert [result.relevance_score for result in results] == [0.99, 0.55]
     post_call = next(call for call in calls if call[0] == "post")
+    post_json = cast(dict[str, object], post_call[2]["json"])
+    post_headers = cast(dict[str, str], post_call[2]["headers"])
     assert DEFAULT_RERANK_MODEL == "rerank-2.5"
-    assert post_call[2]["json"]["model"] == "rerank-2.5"
-    assert post_call[2]["json"]["top_k"] == 2
-    assert post_call[2]["headers"]["Authorization"] == "Bearer test-key"
+    assert post_json["model"] == "rerank-2.5"
+    assert post_json["top_k"] == 2
+    assert post_headers["Authorization"] == "Bearer test-key"

@@ -1,4 +1,6 @@
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -18,7 +20,9 @@ def _doc(content: str) -> models.Document:
 
 
 @pytest.mark.asyncio
-async def test_maybe_rerank_documents_reorders_by_rerank_indices(monkeypatch):
+async def test_maybe_rerank_documents_reorders_by_rerank_indices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     docs = [_doc("first"), _doc("second"), _doc("third")]
     monkeypatch.setattr(
         document,
@@ -31,7 +35,7 @@ async def test_maybe_rerank_documents_reorders_by_rerank_indices(monkeypatch):
         ),
     )
 
-    result = await document._maybe_rerank_documents(
+    result = await document._maybe_rerank_documents(  # pyright: ignore[reportPrivateUsage]
         query="query", documents=docs, top_k=2, rerank=True
     )
 
@@ -39,11 +43,13 @@ async def test_maybe_rerank_documents_reorders_by_rerank_indices(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_maybe_rerank_documents_falls_back_to_vector_order(monkeypatch):
+async def test_maybe_rerank_documents_falls_back_to_vector_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     docs = [_doc("first"), _doc("second"), _doc("third")]
     monkeypatch.setattr(document, "rerank_texts", AsyncMock(return_value=None))
 
-    result = await document._maybe_rerank_documents(
+    result = await document._maybe_rerank_documents(  # pyright: ignore[reportPrivateUsage]
         query="query", documents=docs, top_k=2, rerank=True
     )
 
@@ -51,21 +57,26 @@ async def test_maybe_rerank_documents_falls_back_to_vector_order(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_query_documents_overfetches_before_reranking(monkeypatch):
-    fetched_top_k = None
+async def test_query_documents_overfetches_before_reranking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fetched_top_k: list[int] = []
     docs = [_doc(str(i)) for i in range(75)]
 
     class FakeDb:
-        def expunge(self, doc):
+        def expunge(self, _doc: models.Document) -> None:
             pass
 
     @asynccontextmanager
-    async def fake_tracked_db(_name):
+    async def fake_tracked_db(
+        _name: str, *, read_only: bool = False
+    ) -> AsyncGenerator[FakeDb]:
+        _ = read_only
         yield FakeDb()
 
-    async def fake_pgvector(*args):
-        nonlocal fetched_top_k
-        fetched_top_k = args[-1]
+    async def fake_pgvector(*args: Any) -> list[models.Document]:
+        if isinstance(args[-1], int):
+            fetched_top_k.append(args[-1])
         return docs
 
     monkeypatch.setattr(document, "_uses_pgvector", lambda: True)
@@ -86,6 +97,6 @@ async def test_query_documents_overfetches_before_reranking(monkeypatch):
         rerank=True,
     )
 
-    assert fetched_top_k == 75
+    assert fetched_top_k == [75]
     assert len(result) == 12
     mock_rerank.assert_awaited_once()

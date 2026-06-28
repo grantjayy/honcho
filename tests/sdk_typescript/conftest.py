@@ -9,7 +9,7 @@ import socket
 import threading
 import time
 from collections.abc import Generator
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from threading import Thread
 from typing import Any
 from unittest.mock import patch
@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from uvicorn.config import Config
 from uvicorn.server import Server
 
-from src.dependencies import get_db
+from src.dependencies import get_db, get_read_db
 from src.main import app
 
 
@@ -95,6 +95,9 @@ def ts_test_server(
             yield session
 
     app.dependency_overrides[get_db] = override_get_db
+    # Read-only routes use get_read_db (AUTOCOMMIT engine) in production; in
+    # tests they must resolve to the same per-test database.
+    app.dependency_overrides[get_read_db] = override_get_db
 
     # No-op the lifespan's startup embedding-schema validator — same
     # reasoning as the `client` fixture in tests/conftest.py: the module-
@@ -133,24 +136,40 @@ def mock_tracked_db(ts_db_session: async_sessionmaker[AsyncSession]):
 
     # Create a tracked_db that uses fresh sessions (not shared)
     @asynccontextmanager
-    async def ts_tracked_db(_: str | None = None):
+    async def ts_tracked_db(_: str | None = None, *, read_only: bool = False):
+        # read_only accepted (and ignored): tests use one per-test database.
+        del read_only
         async with ts_db_session() as session:
             yield session
 
-    with (
-        patch("src.dependencies.tracked_db", ts_tracked_db),
-        patch("src.deriver.queue_manager.tracked_db", ts_tracked_db),
-        patch("src.deriver.consumer.tracked_db", ts_tracked_db),
-        patch("src.deriver.enqueue.tracked_db", ts_tracked_db),
-        patch("src.routers.peers.tracked_db", ts_tracked_db),
-        patch("src.crud.representation.tracked_db", ts_tracked_db),
-        patch("src.dreamer.dream_scheduler.tracked_db", ts_tracked_db),
-        patch("src.dreamer.orchestrator.tracked_db", ts_tracked_db),
-        patch("src.dialectic.chat.tracked_db", ts_tracked_db),
-        patch("src.utils.summarizer.tracked_db", ts_tracked_db),
-        patch("src.webhooks.events.tracked_db", ts_tracked_db),
-        patch("src.webhooks.webhook_delivery.tracked_db", ts_tracked_db),
-        patch("src.utils.search.tracked_db", ts_tracked_db),
-        patch("src.crud.message.tracked_db", ts_tracked_db),
-    ):
+    tracked_db_patch_targets = (
+        "src.dependencies.tracked_db",
+        "src.crud.document.tracked_db",
+        "src.crud.message.tracked_db",
+        "src.crud.representation.tracked_db",
+        "src.deriver.consumer.tracked_db",
+        "src.deriver.deriver.tracked_db",
+        "src.deriver.enqueue.tracked_db",
+        "src.deriver.queue_manager.tracked_db",
+        "src.dialectic.chat.tracked_db",
+        "src.dialectic.core.tracked_db",
+        "src.dreamer.dream_scheduler.tracked_db",
+        "src.dreamer.orchestrator.tracked_db",
+        "src.dreamer.specialists.tracked_db",
+        "src.dreamer.surprisal.tracked_db",
+        "src.reconciler.embed_now.tracked_db",
+        "src.reconciler.queue_cleanup.tracked_db",
+        "src.reconciler.scheduler.tracked_db",
+        "src.reconciler.sync_vectors.tracked_db",
+        "src.routers.peers.tracked_db",
+        "src.utils.agent_tools.tracked_db",
+        "src.utils.search.tracked_db",
+        "src.utils.summarizer.tracked_db",
+        "src.webhooks.events.tracked_db",
+        "src.webhooks.webhook_delivery.tracked_db",
+    )
+
+    with ExitStack() as stack:
+        for target in tracked_db_patch_targets:
+            stack.enter_context(patch(target, ts_tracked_db))
         yield
