@@ -11,7 +11,7 @@ from src.embedding_client import _EmbeddingClient
 
 @pytest.mark.asyncio
 async def test_voyage_embed_uses_query_input_type_and_default_dimension() -> None:
-    seen_payloads: list[dict] = []
+    seen_payloads: list[dict[str, object]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         payload = dict(json.loads(request.content))
@@ -72,7 +72,7 @@ async def test_voyage_embed_uses_query_input_type_and_default_dimension() -> Non
 
 @pytest.mark.asyncio
 async def test_voyage_batch_embed_uses_document_input_type() -> None:
-    seen_payloads: list[dict] = []
+    seen_payloads: list[dict[str, object]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         payload = dict(json.loads(request.content))
