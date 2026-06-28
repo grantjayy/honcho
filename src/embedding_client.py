@@ -19,6 +19,19 @@ logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
 
+def _embedding_encoding_for_model(model: str) -> tiktoken.Encoding:
+    try:
+        return tiktoken.encoding_for_model(model)
+    except KeyError:
+        return tiktoken.get_encoding("cl100k_base")
+
+
+def get_embedding_encoding() -> tiktoken.Encoding:
+    """Return the configured embedding tokenizer without creating a provider client."""
+    runtime_config = resolve_embedding_model_config(settings.EMBEDDING.MODEL_CONFIG)
+    return _embedding_encoding_for_model(runtime_config.model)
+
+
 async def _emit_embedding_call(
     *,
     provider: str,
@@ -201,10 +214,7 @@ class _EmbeddingClient:
             self.max_embedding_tokens = max_input_tokens
             self.max_batch_size = 2048  # OpenAI batch limit
 
-        try:
-            self.encoding: tiktoken.Encoding = tiktoken.encoding_for_model(self.model)
-        except KeyError:
-            self.encoding = tiktoken.get_encoding("cl100k_base")
+        self.encoding = _embedding_encoding_for_model(self.model)
         if self.transport != "voyage":
             self.max_embedding_tokens_per_request: int = max_tokens_per_request
 

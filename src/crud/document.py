@@ -16,7 +16,7 @@ from src.crud.collection import get_or_create_collection
 from src.crud.peer import get_peer
 from src.crud.session import get_session
 from src.dependencies import tracked_db
-from src.embedding_client import embedding_client
+from src.embedding_client import embedding_client, get_embedding_encoding
 from src.exceptions import (
     ResourceNotFoundException,
     ValidationException,
@@ -1064,9 +1064,13 @@ async def is_rejected_duplicate(
 
     existing_doc = similar_docs[0]
 
-    # Step 2: Determine which has more information using token set difference
-    tokens_new = set(embedding_client.encoding.encode(doc.content))
-    tokens_existing = set(embedding_client.encoding.encode(existing_doc.content))
+    # Step 2: Determine which has more information using token set difference.
+    # This path only needs tokenization, so avoid instantiating the embedding
+    # transport client; duplicate detection must work in local/offline tests that
+    # provide an embedding directly without provider credentials.
+    encoding = get_embedding_encoding()
+    tokens_new = set(encoding.encode(doc.content))
+    tokens_existing = set(encoding.encode(existing_doc.content))
 
     unique_new = len(tokens_new - tokens_existing)
     unique_existing = len(tokens_existing - tokens_new)
