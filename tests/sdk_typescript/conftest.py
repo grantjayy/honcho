@@ -145,6 +145,10 @@ def mock_tracked_db(ts_db_session: async_sessionmaker[AsyncSession]):
     with (
         patch("src.dependencies.tracked_db", ts_tracked_db),
         patch("src.deriver.queue_manager.tracked_db", ts_tracked_db),
+        patch("src.reconciler.embed_now.tracked_db", ts_tracked_db),
+        patch("src.reconciler.sync_vectors.tracked_db", ts_tracked_db),
+        patch("src.reconciler.scheduler.tracked_db", ts_tracked_db),
+        patch("src.reconciler.queue_cleanup.tracked_db", ts_tracked_db),
         patch("src.deriver.consumer.tracked_db", ts_tracked_db),
         patch("src.deriver.enqueue.tracked_db", ts_tracked_db),
         patch("src.routers.peers.tracked_db", ts_tracked_db),
