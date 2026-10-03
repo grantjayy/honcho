@@ -1,0 +1,9 @@
+services:
+  api:
+    env_file:
+      - path: /Users/grantjordan/.hermes/state/grok-subscription-bridge/honcho.env
+        required: true
+  deriver:
+    env_file:
+      - path: /Users/grantjordan/.hermes/state/grok-subscription-bridge/honcho.env
+        required: true
