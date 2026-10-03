@@ -380,6 +380,41 @@ def test_rejects_unapproved_upstream_without_transport(
         thread.join()
 
 
+@pytest.mark.parametrize(
+    "base_url, expected",
+    [
+        ("https://api.x.ai", "https://api.x.ai/v1/chat/completions"),
+        ("https://api.x.ai/", "https://api.x.ai/v1/chat/completions"),
+        ("https://api.x.ai/v1", "https://api.x.ai/v1/chat/completions"),
+        (
+            "https://cli-chat-proxy.grok.com",
+            "https://cli-chat-proxy.grok.com/v1/chat/completions",
+        ),
+    ],
+)
+def test_accepts_approved_origins_and_preserves_resolved_host(
+    base_url: str, expected: str
+) -> None:
+    assert bridge.validate_base_url(base_url) + "/chat/completions" == expected
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://api.x.ai",
+        "https://attacker.test",
+        "https://api.x.ai:443",
+        "https://user:pass@api.x.ai",
+        "https://api.x.ai/v2",
+        "https://api.x.ai/v1?query=1",
+        "https://api.x.ai/v1#fragment",
+    ],
+)
+def test_rejects_unapproved_api_origin_variants(base_url: str) -> None:
+    with pytest.raises(ValueError, match="invalid upstream"):
+        bridge.validate_base_url(base_url)
+
+
 def test_rejects_oversized_body(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GROK_BRIDGE_TOKEN", "bridge-secret")
     monkeypatch.setattr(bridge, "MAX_BODY_BYTES", 32)

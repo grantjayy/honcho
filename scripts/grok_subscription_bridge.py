@@ -15,6 +15,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 MAX_BODY_BYTES = 2 * 1024 * 1024
 UPSTREAM_TIMEOUT_SECONDS = 60.0
 APPROVED_HOST = "cli-chat-proxy.grok.com"
+APPROVED_HOSTS = {APPROVED_HOST, "api.x.ai"}
 
 
 class UpstreamResponse(NamedTuple):
@@ -70,7 +71,7 @@ def validate_base_url(base_url: str) -> str:
     parsed = urlsplit(base_url)
     if (
         parsed.scheme != "https"
-        or parsed.hostname != APPROVED_HOST
+        or parsed.hostname not in APPROVED_HOSTS
         or parsed.port is not None
         or parsed.username is not None
         or parsed.password is not None
@@ -79,7 +80,7 @@ def validate_base_url(base_url: str) -> str:
         or parsed.fragment
     ):
         raise ValueError("invalid upstream")
-    return f"https://{APPROVED_HOST}/v1"
+    return f"https://{parsed.hostname}/v1"
 
 
 def make_server(
