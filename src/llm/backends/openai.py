@@ -220,6 +220,13 @@ class OpenAIBackend:
                 # direct call.
                 truncated = exc.completion
                 raw_content = truncated.choices[0].message.content or ""
+                if not raw_content.strip():
+                    # Reasoning models can spend the whole budget thinking and
+                    # return no text. Nothing to repair, so raise and let the
+                    # retry/fallback chain run instead of saving zero results.
+                    raise ValidationException(
+                        f"Model {model} hit max_tokens before producing output"
+                    ) from exc
                 content = repair_response_model_json(
                     raw_content,
                     response_format,

@@ -188,19 +188,22 @@ async def test_valid_empty_explicit_list_is_not_retried(mode: str | None) -> Non
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("finish_reason", "mode"),
-    [
-        pytest.param("stop", "json_object", id="json_object-empty"),
-        pytest.param("length", None, id="json_schema-truncated-empty"),
-    ],
-)
-async def test_empty_content_keeps_returning_empty_without_retry(
-    finish_reason: str, mode: str | None
-) -> None:
+async def test_json_object_empty_content_returns_empty_without_retry() -> None:
     provider, response = await _derive(
-        [("", finish_reason)], structured_output_mode=mode
+        [("", "stop")], structured_output_mode="json_object"
     )
 
     assert provider.models == [PRIMARY]
     assert response.content == PromptRepresentation(explicit=[])
+
+
+@pytest.mark.asyncio
+async def test_truncated_empty_content_is_retried_then_uses_fallback() -> None:
+    # Production failure mode: a reasoning model spends all of max_tokens on
+    # reasoning and returns finish_reason=length with no text.
+    provider, response = await _derive(
+        [("", "length"), ("", "length"), (VALID_JSON, "stop")]
+    )
+
+    assert provider.models == [PRIMARY, PRIMARY, FALLBACK]
+    assert [obs.content for obs in response.content.explicit] == ["the user likes tea"]

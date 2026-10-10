@@ -20,6 +20,7 @@ from openai.types.chat.chat_completion_message import ChatCompletionMessage
 from openai.types.completion_usage import CompletionUsage
 from pydantic import BaseModel, ValidationError
 
+from src.exceptions import ValidationException
 from src.llm import CLIENTS, HonchoLLMCallResponse, honcho_llm_call_inner
 from src.utils.representation import PromptRepresentation
 
@@ -196,13 +197,17 @@ class TestOpenAILengthFinishReasonRepair:
                 json_mode=True,
             )
 
-    async def test_empty_content_falls_back_to_empty(self) -> None:
-        """Empty/null content should fall back to empty PromptRepresentation."""
+    async def test_empty_content_raises_for_retry(self) -> None:
+        """Truncated empty content (all tokens spent reasoning) raises so the
+        retry/fallback chain runs instead of saving zero observations."""
         mock_client = AsyncMock(spec=AsyncOpenAI)
         mock_client.chat.completions.parse = _raise_length_error("")
 
-        with patch.dict(CLIENTS, {"openai": mock_client}):
-            response = await honcho_llm_call_inner(
+        with (
+            patch.dict(CLIENTS, {"openai": mock_client}),
+            pytest.raises(ValidationException),
+        ):
+            await honcho_llm_call_inner(
                 provider="openai",
                 model="test-model",
                 prompt="Analyze messages",
@@ -210,9 +215,6 @@ class TestOpenAILengthFinishReasonRepair:
                 response_model=PromptRepresentation,
                 json_mode=True,
             )
-
-        assert isinstance(response.content, PromptRepresentation)
-        assert response.content.explicit == []
 
     async def test_non_prompt_representation_reraises_on_unfixable(self) -> None:
         """Non-PromptRepresentation with unrepairable JSON should raise ValidationError."""
