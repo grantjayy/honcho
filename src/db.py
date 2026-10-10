@@ -25,6 +25,9 @@ connect_args = {
     # Bound a single connection attempt so it fails fast instead of hanging when
     # the server/pooler is unreachable or stalled (psycopg, seconds).
     "connect_timeout": settings.DB.CONNECT_TIMEOUT_SECONDS,
+    # One global HNSW index stops at ef_search (40) candidates before the observer
+    # filter, which returned 17-38 of 75 requested rows; strict_order returned 75.
+    "options": "-c hnsw.iterative_scan=strict_order",
 }
 
 # Context variable to store request context
