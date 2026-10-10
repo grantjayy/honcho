@@ -20,6 +20,7 @@ from src.exceptions import (
     ResourceNotFoundException,
     ValidationException,
 )
+from src.routers.peers import FOCUSED_CONTEXT_OVERFETCH_K
 from src.security import JWTParams, require_auth
 from src.telemetry.events import EmbeddingCallPurpose, GetContextEvent, emit
 from src.utils import summarizer
@@ -65,6 +66,8 @@ async def _get_working_representation_task(
     include_most_derived: bool,
     max_observations: int | None,
     embedding: list[float] | None = None,
+    semantic_search_overfetch_k: int | None = None,
+    semantic_rerank: bool = False,
 ) -> Representation:
     """
     Get working representation using an externally-provided DB session.
@@ -81,6 +84,8 @@ async def _get_working_representation_task(
         include_most_derived: Whether to include the most derived observations in the representation
         max_observations: Maximum number of observations to include in the representation
         embedding: Pre-computed embedding for the semantic query
+        semantic_search_overfetch_k: Semantic vector candidates to fetch before reranking
+        semantic_rerank: Whether to rerank the semantic vector candidates
 
     Returns:
         The working representation
@@ -96,6 +101,8 @@ async def _get_working_representation_task(
         semantic_search_max_distance=search_max_distance,
         include_most_derived=include_most_derived,
         embedding=embedding,
+        semantic_search_overfetch_k=semantic_search_overfetch_k,
+        semantic_rerank=semantic_rerank,
         max_observations=max_observations
         if max_observations is not None
         else config.settings.DERIVER.WORKING_REPRESENTATION_MAX_OBSERVATIONS,
@@ -976,6 +983,11 @@ async def get_session_context(
         else ([session_id] if limit_to_session else None)
     )
 
+    # Rerank a focused search the same way the peer context route does. The
+    # reranker picks which conclusions are selected; the representation still
+    # presents them chronologically.
+    focused_query = bool(search_query) and embedding is not None
+
     # Sequential calls on shared DB session
     representation = await _get_working_representation_task(
         db,
@@ -991,6 +1003,10 @@ async def get_session_context(
         include_most_derived=include_most_frequent,
         max_observations=max_conclusions,
         embedding=embedding,
+        semantic_search_overfetch_k=FOCUSED_CONTEXT_OVERFETCH_K
+        if focused_query
+        else None,
+        semantic_rerank=focused_query,
     )
     # A peer card is keyed by (workspace, observer, observed) with no session
     # dimension (crud/peer_card.py), so it is synthesized from everything the
