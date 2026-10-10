@@ -1,11 +1,14 @@
+import asyncio
 import datetime
 from collections.abc import Sequence
+from dataclasses import dataclass, field
+from enum import Enum
 from logging import getLogger
-from typing import Any, cast
+from typing import Any, Literal, cast
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, literal, or_, select, union_all, update
 from sqlalchemy.engine import CursorResult
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import Select
 from sqlalchemy.sql.functions import func
@@ -13,10 +16,14 @@ from sqlalchemy.sql.functions import func
 from src import models, schemas
 from src.config import settings
 from src.crud.collection import get_or_create_collection
-from src.crud.peer import get_peer
+from src.crud.peer import get_peer, reject_scope_observed
 from src.crud.session import get_session
 from src.dependencies import tracked_db
-from src.embedding_client import embedding_client, get_embedding_encoding
+from src.embedding_client import (
+    EmbeddingTokenLimitError,
+    embedding_client,
+    get_embedding_encoding,
+)
 from src.exceptions import (
     ResourceNotFoundException,
     ValidationException,
@@ -31,6 +38,24 @@ from src.vector_store import (
 )
 
 logger = getLogger(__name__)
+
+
+def build_source_links(
+    source_ids: list[str] | None, workspace_name: str
+) -> list[models.DocumentSource]:
+    """Convert an LLM-provided source_ids list to DocumentSource rows.
+
+    Dedupes (the PK is (derived_id, source_id)) and drops entries that are
+    not shaped like document IDs — the model occasionally emits timestamps
+    or numeric refs under schema pressure.
+    """
+    if not source_ids:
+        return []
+    return [
+        models.DocumentSource(source_id=sid, position=i, workspace_name=workspace_name)
+        for i, sid in enumerate(dict.fromkeys(source_ids))
+        if models.SOURCE_ID_RE.match(sid)
+    ]
 
 
 def get_all_documents(
@@ -110,11 +135,14 @@ def get_documents_with_filters(
     # Apply additional filters if provided
     stmt = apply_filter(stmt, models.Document, filters)
 
-    # Order by created_at (newest first by default)
+    # created_at is the transaction timestamp, so documents created in the
+    # same batch share it -- id keeps pagination deterministic.
     if reverse:
-        stmt = stmt.order_by(models.Document.created_at.asc())
+        stmt = stmt.order_by(models.Document.created_at.asc(), models.Document.id.asc())
     else:
-        stmt = stmt.order_by(models.Document.created_at.desc())
+        stmt = stmt.order_by(
+            models.Document.created_at.desc(), models.Document.id.desc()
+        )
 
     return stmt
 
@@ -209,6 +237,36 @@ def _uses_pgvector() -> bool:
     )
 
 
+# Shared by is_rejected_duplicate and create_documents candidate resolution.
+_SEMANTIC_DUP_MAX_DISTANCE = 0.05
+_SEMANTIC_DUP_TOP_K = 1
+_SEMANTIC_CANDIDATE_CONCURRENCY = 8
+
+
+def _semantic_dup_filters(doc: schemas.DocumentCreate) -> dict[str, Any] | None:
+    """Merge scope for semantic dedup: never across levels, never across
+    sessions for explicit documents. None when the document has no valid
+    merge partner (session-less explicit)."""
+    filters: dict[str, Any] = {"level": doc.level}
+    if doc.level == "explicit":
+        if doc.session_name is None:
+            return None
+        filters["session_name"] = doc.session_name
+    return filters
+
+
+def _matches_semantic_dup_filters(
+    document: models.Document, filters: dict[str, Any]
+) -> bool:
+    """In-Python mirror of ``_semantic_dup_filters`` applied as SQL.
+
+    Used when candidates were prefetched for a whole batch and so could not be
+    narrowed per document in the query itself. Only the equality filters
+    ``_semantic_dup_filters`` produces are supported.
+    """
+    return all(getattr(document, key) == value for key, value in filters.items())
+
+
 async def query_external_vector_document_ids(
     workspace_name: str,
     observer: str,
@@ -229,6 +287,9 @@ async def query_external_vector_document_ids(
     """
     if _uses_pgvector():
         return None
+
+    if top_k <= 0:
+        return []
 
     external_vector_store = get_external_vector_store()
     if external_vector_store is None:
@@ -367,7 +428,7 @@ async def query_documents(
     if embedding is None:
         try:
             embedding = await embedding_client.embed(query)
-        except ValueError as e:
+        except EmbeddingTokenLimitError as e:
             raise ValidationException(
                 "Query exceeds maximum token limit of "
                 + f"{settings.EMBEDDING.MAX_INPUT_TOKENS}."
@@ -473,9 +534,7 @@ async def _maybe_rerank_documents(
         reranked_docs.append(docs[result.index])
 
     if len(reranked_docs) < top_k:
-        reranked_docs.extend(
-            doc for index, doc in enumerate(docs) if index not in seen
-        )
+        reranked_docs.extend(doc for index, doc in enumerate(docs) if index not in seen)
 
     return reranked_docs[:top_k]
 
@@ -493,6 +552,49 @@ def _normalize_content(content: str) -> str:
     return content.strip().lower()
 
 
+def _dedup_key(
+    content: str, level: str, session_name: str | None
+) -> tuple[str, str, str | None]:
+    """Build the exact-match dedup key for a document.
+
+    Dedup never crosses levels: a same-content document at a different level is
+    a different kind of record (an explicit fact is not interchangeable with a
+    deductive conclusion that happens to share its text).
+
+    For **explicit** documents dedup additionally never crosses sessions.
+    Explicit documents are session-pure records of what was derived from that
+    session's messages — the Scopes copy-by-session model depends on this — so
+    a repeat of the same fact in a different session must produce a new
+    document in that session rather than reinforce another session's row.
+    Derived levels (deductive/inductive/contradiction) are consolidations and
+    may still dedup across sessions.
+    """
+    return (
+        _normalize_content(content),
+        level,
+        session_name if level == "explicit" else None,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _DocumentRowOp:
+    kind: Literal["reinforce", "replace"]
+    document_id: str
+    incoming_times_derived: int = 1
+    # When a reinforce skipped insert and the locked target is gone/deleted,
+    # insert this document instead of dropping it.
+    fallback_document: schemas.DocumentCreate | None = None
+
+
+@dataclass
+class CreateDocumentsResult:
+    created_documents: list[schemas.DocumentCreate] = field(default_factory=list)
+    exact_dup_in_batch_count: int = 0
+    exact_dup_existing_count: int = 0
+    semantic_dup_rejected_count: int = 0
+    semantic_dup_replaced_count: int = 0
+
+
 async def create_documents(
     db: AsyncSession,
     documents: list[schemas.DocumentCreate],
@@ -501,13 +603,13 @@ async def create_documents(
     observer: str,
     observed: str,
     deduplicate: bool = False,
-) -> list[schemas.DocumentCreate]:
+) -> CreateDocumentsResult:
     """
     Create multiple documents with optional duplicate detection.
 
     The ``deduplicate`` flag additionally enables semantic (cosine-similarity)
-    dedup via ``is_rejected_duplicate`` for documents that survive the exact
-    deduplication check.
+    dedup for documents that survive the exact deduplication check. Candidates
+    for the whole batch are resolved in one pass before the loop.
 
     Args:
         db: Database session
@@ -526,12 +628,81 @@ async def create_documents(
     # Store (document_model, embedding) pairs - IDs aren't available until after commit
     docs_with_embeddings: list[tuple[models.Document, list[float]]] = []
 
+    # Resolve semantic dup candidates for the whole batch up front, then load
+    # every candidate row in one query. The per-document decision in the loop
+    # below is pure Python, so dedup costs a fixed number of round trips rather
+    # than one similarity query per document.
+    semantic_candidate_ids: list[list[str]] = [[] for _ in documents]
+    semantic_candidates_by_id: dict[str, models.Document] = {}
+    if deduplicate:
+        if _uses_pgvector():
+            try:
+                semantic_candidate_ids = await _pgvector_dup_candidates(
+                    db,
+                    documents,
+                    workspace_name,
+                    observer=observer,
+                    observed=observed,
+                )
+            except SQLAlchemyError:
+                # Dead transaction: continuing would cascade PendingRollbackErrors.
+                await db.rollback()
+                raise
+        else:
+            # External store: resolve before the first DB statement so no
+            # connection is held open across the network calls.
+            resolve_sem = asyncio.Semaphore(_SEMANTIC_CANDIDATE_CONCURRENCY)
+
+            async def _resolve_candidates(
+                index: int, doc: schemas.DocumentCreate
+            ) -> None:
+                filters = _semantic_dup_filters(doc)
+                if filters is None or not doc.embedding:
+                    return
+                async with resolve_sem:
+                    try:
+                        ids = await query_external_vector_document_ids(
+                            workspace_name=workspace_name,
+                            observer=observer,
+                            observed=observed,
+                            embedding=doc.embedding,
+                            top_k=_SEMANTIC_DUP_TOP_K,
+                            max_distance=_SEMANTIC_DUP_MAX_DISTANCE,
+                            filters=filters,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "External semantic-candidate resolve failed for %s/%s/%s",
+                            workspace_name,
+                            observer,
+                            observed,
+                        )
+                        return
+                    semantic_candidate_ids[index] = ids or []
+
+            await asyncio.gather(
+                *(_resolve_candidates(i, doc) for i, doc in enumerate(documents))
+            )
+
+        try:
+            semantic_candidates_by_id = await _fetch_dup_candidates_by_id(
+                db,
+                semantic_candidate_ids,
+                workspace_name,
+                observer=observer,
+                observed=observed,
+            )
+        except SQLAlchemyError:
+            await db.rollback()
+            raise
+
     # exact-content dedup (independent of `deduplicate`): pre-fetch
     # existing live documents whose normalized content matches anything in this
     # batch, scoped to (workspace, observer, observed). The SQL normalization must
-    # mirror _normalize_content.
+    # mirror _normalize_content. Matching is further scoped per-document by
+    # level (always) and session (for explicit documents) via _dedup_key.
     batch_normalized: set[str] = {_normalize_content(d.content) for d in documents}
-    existing_by_normalized: dict[str, models.Document] = {}
+    existing_by_key: dict[tuple[str, str, str | None], models.Document] = {}
     if batch_normalized:
         # The `normalized_content_sql.in_(...)` filter below narrows to the
         # (workspace, observer, observed) partition via the single-column indexes,
@@ -559,106 +730,155 @@ async def create_documents(
             )
         )
         for existing_doc in existing_result.scalars():
-            # If multiple historical rows share normalized content, reinforcing
+            # If multiple historical rows share a dedup key, reinforcing
             # one is sufficient; keep the first.
-            existing_by_normalized.setdefault(
-                _normalize_content(existing_doc.content), existing_doc
+            existing_by_key.setdefault(
+                _dedup_key(
+                    existing_doc.content,
+                    existing_doc.level,
+                    existing_doc.session_name,
+                ),
+                existing_doc,
             )
 
-    # Tracks normalized content already accepted from this batch so exact
+    # Tracks dedup keys already accepted from this batch so exact
     # duplicates within a single inference call collapse to one document.
-    seen_in_batch: set[str] = set()
+    seen_in_batch: set[tuple[str, str, str | None]] = set()
+    row_ops: list[_DocumentRowOp] = []
+    pending_times_derived: dict[str, int] = {}
 
-    for doc in documents:
+    exact_dup_existing_count = 0
+    exact_dup_in_batch_count = 0
+    semantic_dup_rejected_count = 0
+    semantic_dup_replaced_count = 0
+    for index, doc in enumerate(documents):
         try:
-            normalized_content = _normalize_content(doc.content)
+            # Session-purity invariant: an explicit document must always carry
+            # the session it was derived from. Refuse to write session-less
+            # explicit documents rather than silently minting global explicit
+            # memory (the Scopes copy-by-session model depends on explicit
+            # documents staying session-pure).
+            if doc.level == "explicit" and doc.session_name is None:
+                logger.error(
+                    "Refusing to create explicit document without session_name in %s/%s/%s (session-purity invariant): %r",
+                    workspace_name,
+                    observer,
+                    observed,
+                    doc.content[:80],
+                )
+                continue
+
+            dedup_key = _dedup_key(doc.content, doc.level, doc.session_name)
 
             # Exact-match dedup, always on:
             # 1) collapse exact duplicates within this batch (drop silently).
-            if normalized_content in seen_in_batch:
+            if dedup_key in seen_in_batch:
+                exact_dup_in_batch_count += 1
                 continue
-            seen_in_batch.add(normalized_content)
+            seen_in_batch.add(dedup_key)
 
             # 2) drop exact duplicates of an existing live document, recording
             #    the re-derivation as reinforcement on the existing row.
-            existing_match = existing_by_normalized.get(normalized_content)
+            existing_match = existing_by_key.get(dedup_key)
             if existing_match is not None:
-                # Reinforce the existing row. greatest(...) keeps the bump atomic
-                # server-side (concurrent workers can't lose an increment) while
-                # still honoring an incoming doc that already carries accumulated
-                # reinforcement (times_derived > 1, e.g. a future re-ingestion or
-                # collection-merge path). Mirrors the superior-replacement branch
-                # in is_rejected_duplicate.
-                existing_match.times_derived = func.greatest(
-                    models.Document.times_derived + 1,
-                    doc.times_derived,
+                current_td = pending_times_derived.get(
+                    existing_match.id, existing_match.times_derived
                 )
-                await db.flush()
+                pending_times_derived[existing_match.id] = max(
+                    current_td + 1, doc.times_derived
+                )
+                row_ops.append(
+                    _DocumentRowOp(
+                        "reinforce",
+                        existing_match.id,
+                        doc.times_derived,
+                        fallback_document=doc,
+                    )
+                )
+                exact_dup_existing_count += 1
                 continue
 
-            # for each document, if deduplicate is True, perform a process
-            # that checks against existing documents and either rejects this document
-            # as a duplicate OR deletes an existing document that is a duplicate.
             if deduplicate:
-                is_duplicate = await is_rejected_duplicate(
-                    db, doc, workspace_name, observer=observer, observed=observed
+                duplicate_result, existing_dup = _resolve_semantic_dup(
+                    doc,
+                    semantic_candidate_ids[index],
+                    semantic_candidates_by_id,
                 )
-                if is_duplicate:
+                if (
+                    duplicate_result is SemanticRejectionResult.REPLACED_EXISTING
+                    and existing_dup is not None
+                ):
+                    current_td = pending_times_derived.get(
+                        existing_dup.id, existing_dup.times_derived
+                    )
+                    doc.times_derived = max(doc.times_derived, current_td + 1)
+                    pending_times_derived[existing_dup.id] = doc.times_derived
+                    row_ops.append(_DocumentRowOp("replace", existing_dup.id))
+                    semantic_dup_replaced_count += 1
+                elif (
+                    duplicate_result is SemanticRejectionResult.REJECTED
+                    and existing_dup is not None
+                ):
+                    current_td = pending_times_derived.get(
+                        existing_dup.id, existing_dup.times_derived
+                    )
+                    pending_times_derived[existing_dup.id] = max(
+                        current_td + 1, doc.times_derived
+                    )
+                    row_ops.append(
+                        _DocumentRowOp(
+                            "reinforce",
+                            existing_dup.id,
+                            doc.times_derived,
+                            fallback_document=doc,
+                        )
+                    )
+                    semantic_dup_rejected_count += 1
                     continue
 
-            metadata_dict = doc.metadata.model_dump(exclude_none=True)
-
-            # Determine if we need to persist embeddings to postgres
-            # True when: TYPE=pgvector OR still migrating (dual-write to both stores)
-            store_embeddings_in_postgres = (
-                settings.VECTOR_STORE.TYPE == "pgvector"
-                or not settings.VECTOR_STORE.MIGRATED
+            new_doc = _document_model_from_create(
+                doc, workspace_name=workspace_name, observer=observer, observed=observed
             )
-
-            if store_embeddings_in_postgres and doc.embedding:
-                new_doc = models.Document(
-                    workspace_name=workspace_name,
-                    observer=observer,
-                    observed=observed,
-                    content=doc.content,
-                    level=doc.level,
-                    times_derived=doc.times_derived,
-                    internal_metadata=metadata_dict,
-                    session_name=doc.session_name,
-                    embedding=doc.embedding,
-                    # Tree linkage column
-                    source_ids=doc.source_ids,
-                )
-            else:
-                new_doc = models.Document(
-                    workspace_name=workspace_name,
-                    observer=observer,
-                    observed=observed,
-                    content=doc.content,
-                    level=doc.level,
-                    times_derived=doc.times_derived,
-                    internal_metadata=metadata_dict,
-                    session_name=doc.session_name,
-                    # Tree linkage column
-                    source_ids=doc.source_ids,
-                )
-
-            if doc.embedding:
-                new_doc.sync_state = "pending"
             honcho_documents.append(new_doc)
             accepted_documents.append(doc)
-
-            # Track embedding for vector store (ID will be available after commit)
             if doc.embedding:
                 docs_with_embeddings.append((new_doc, doc.embedding))
 
+        except IntegrityError as e:
+            await db.rollback()
+            raise ValidationException(
+                "Failed to create documents due to integrity constraint violation"
+            ) from e
+        except SQLAlchemyError:
+            # Dead transaction: continuing would cascade PendingRollbackErrors.
+            await db.rollback()
+            raise
         except Exception as e:
+            # Per-document failures (bad content, metadata, token overflow).
             logger.error(
                 f"Error adding new document to {workspace_name}/{doc.session_name}/{observer}/{observed}: {e}"
             )
             continue
 
     try:
+        fallback_docs = await _apply_document_row_updates(
+            db,
+            row_ops,
+            workspace_name=workspace_name,
+            observer=observer,
+            observed=observed,
+        )
+        for fallback_doc in fallback_docs:
+            new_doc = _document_model_from_create(
+                fallback_doc,
+                workspace_name=workspace_name,
+                observer=observer,
+                observed=observed,
+            )
+            honcho_documents.append(new_doc)
+            accepted_documents.append(fallback_doc)
+            if fallback_doc.embedding:
+                docs_with_embeddings.append((new_doc, fallback_doc.embedding))
         db.add_all(honcho_documents)
         # NOTE
         # If the process crashes after this commit but before vector upsert completes,
@@ -754,8 +974,19 @@ async def create_documents(
         raise ValidationException(
             "Failed to create documents due to integrity constraint violation"
         ) from e
+    except DBAPIError:
+        # Leave the session clean for callers that own it (e.g. a deadlock
+        # at the final commit); the queue layer classifies and retries.
+        await db.rollback()
+        raise
 
-    return accepted_documents
+    return CreateDocumentsResult(
+        created_documents=accepted_documents,
+        exact_dup_existing_count=exact_dup_existing_count,
+        exact_dup_in_batch_count=exact_dup_in_batch_count,
+        semantic_dup_rejected_count=semantic_dup_rejected_count,
+        semantic_dup_replaced_count=semantic_dup_replaced_count,
+    )
 
 
 async def delete_document(
@@ -931,7 +1162,25 @@ async def create_observations(
 
     # Validate all peers exist
     for peer_name in peers_to_validate:
-        await get_peer(db, workspace_name, schemas.PeerCreate(name=peer_name))
+        await get_peer(db, workspace_name, peer_name)
+
+    # A scope may be an *observer* — that is how scoped conclusions are stored —
+    # but it must never be *observed*: scope peers carry observe_me=false and no
+    # representation is ever formed of one. Without this, a conclusion about a
+    # scope persists and a (observer, scope) collection is created for it.
+    #
+    # The strict variant because this is an observed position, though defence in
+    # depth rather than the active guard: the loop above resolves every peer, so a
+    # reserved name that does not exist yet already 404s before reaching here. If
+    # that validation ever stops covering observed_id, this still refuses the
+    # pre-seeding case instead of persisting a conclusion that a later-created
+    # scope would retroactively own.
+    await reject_scope_observed(
+        db,
+        workspace_name,
+        {obs.observed_id for obs in observations},
+        action="No conclusion is ever formed about a scope.",
+    )
 
     # Get or create all collections
     for observer, observed in collection_pairs:
@@ -942,8 +1191,10 @@ async def create_observations(
     # Generate embeddings in batch
     contents = [obs.content for obs in observations]
     try:
-        embeddings = await embedding_client.simple_batch_embed(contents)
-    except ValueError as e:
+        embeddings = await embedding_client.simple_batch_embed(
+            contents, on_oversize="truncate"
+        )
+    except EmbeddingTokenLimitError as e:
         raise ValidationException(str(e)) from e
 
     # Create document objects and track embeddings for vector store
@@ -1105,6 +1356,279 @@ async def create_observations(
     return honcho_documents
 
 
+def _document_model_from_create(
+    doc: schemas.DocumentCreate,
+    *,
+    workspace_name: str,
+    observer: str,
+    observed: str,
+) -> models.Document:
+    metadata_dict = doc.metadata.model_dump(exclude_none=True)
+    store_embeddings_in_postgres = (
+        settings.VECTOR_STORE.TYPE == "pgvector" or not settings.VECTOR_STORE.MIGRATED
+    )
+    if store_embeddings_in_postgres and doc.embedding:
+        new_doc = models.Document(
+            workspace_name=workspace_name,
+            observer=observer,
+            observed=observed,
+            content=doc.content,
+            level=doc.level,
+            times_derived=doc.times_derived,
+            internal_metadata=metadata_dict,
+            session_name=doc.session_name,
+            embedding=doc.embedding,
+            source_links=build_source_links(doc.source_ids, workspace_name),
+        )
+    else:
+        new_doc = models.Document(
+            workspace_name=workspace_name,
+            observer=observer,
+            observed=observed,
+            content=doc.content,
+            level=doc.level,
+            times_derived=doc.times_derived,
+            internal_metadata=metadata_dict,
+            session_name=doc.session_name,
+            source_links=build_source_links(doc.source_ids, workspace_name),
+        )
+    if doc.embedding:
+        new_doc.sync_state = "pending"
+    return new_doc
+
+
+async def _apply_document_row_updates(
+    db: AsyncSession,
+    ops: list[_DocumentRowOp],
+    *,
+    workspace_name: str,
+    observer: str,
+    observed: str,
+) -> list[schemas.DocumentCreate]:
+    """Lock target rows by id, apply ops, return fallbacks for vanished targets."""
+    if not ops:
+        return []
+    # Deadlock fix: lock in id order (IN-clause order is ignored).
+    ids = sorted({op.document_id for op in ops})
+    result = await db.execute(
+        select(models.Document)
+        .where(
+            models.Document.id.in_(ids),
+            models.Document.workspace_name == workspace_name,
+            models.Document.observer == observer,
+            models.Document.observed == observed,
+        )
+        .order_by(models.Document.id)
+        .with_for_update()
+        # Reload identity-map rows so the Python max() sees concurrent increments.
+        .execution_options(populate_existing=True)
+    )
+    locked = {doc.id: doc for doc in result.scalars()}
+    now = datetime.datetime.now(datetime.UTC)
+    fallbacks: list[schemas.DocumentCreate] = []
+    stale_at_lock = {
+        op.document_id
+        for op in ops
+        if (locked_row := locked.get(op.document_id)) is None
+        or locked_row.deleted_at is not None
+    }
+    for op in ops:
+        row = locked.get(op.document_id)
+        if op.kind == "replace":
+            if row is not None and row.deleted_at is None:
+                row.deleted_at = now
+            continue
+        # reinforce
+        if op.document_id in stale_at_lock:
+            if op.fallback_document is not None:
+                fallbacks.append(op.fallback_document)
+            continue
+        if row is None or row.deleted_at is not None:
+            # An earlier op in this batch replaced this row.
+            continue
+        row.times_derived = max(row.times_derived + 1, op.incoming_times_derived)
+    await db.flush()
+    return fallbacks
+
+
+class SemanticRejectionResult(Enum):
+    NOT_DUPLICATE = 0
+    REPLACED_EXISTING = 1
+    REJECTED = 2
+
+
+def _score_semantic_dup(
+    doc: schemas.DocumentCreate, existing_doc: models.Document
+) -> SemanticRejectionResult:
+    """Pick the survivor between an incoming document and its near-identical match.
+
+    The richer text wins: tokens the other side lacks are weighted ten times a
+    shared token, and a tie keeps the incoming document.
+    """
+    # Only tokenization is needed here, so avoid instantiating the embedding
+    # transport client; duplicate detection must work in local/offline tests
+    # that provide an embedding directly without provider credentials.
+    encoding = get_embedding_encoding()
+    tokens_new = set(encoding.encode(doc.content))
+    tokens_existing = set(encoding.encode(existing_doc.content))
+    unique_new = len(tokens_new - tokens_existing)
+    unique_existing = len(tokens_existing - tokens_new)
+    score_new = len(tokens_new) + (unique_new * 10)
+    score_existing = len(tokens_existing) + (unique_existing * 10)
+    if score_new >= score_existing:
+        return SemanticRejectionResult.REPLACED_EXISTING
+    return SemanticRejectionResult.REJECTED
+
+
+async def _pgvector_dup_candidates(
+    db: AsyncSession,
+    documents: list[schemas.DocumentCreate],
+    workspace_name: str,
+    *,
+    observer: str,
+    observed: str,
+) -> list[list[str]]:
+    """Resolve each document's dup candidates in one round trip.
+
+    The pgvector counterpart to the external store's concurrent
+    ``query_external_vector_document_ids`` fan-out: the per-document nearest
+    neighbour searches are unioned into a single statement. Each leg mirrors
+    ``_query_documents_pgvector`` so both vector paths see the same candidates.
+
+    Returns:
+        Candidate ids per document, positionally aligned with *documents*.
+    """
+    candidates: list[list[str]] = [[] for _ in documents]
+    legs: list[Select[tuple[int, str]]] = []
+    for index, doc in enumerate(documents):
+        filters = _semantic_dup_filters(doc)
+        if filters is None or not doc.embedding:
+            continue
+        distance = models.Document.embedding.cosine_distance(doc.embedding)
+        leg = (
+            select(models.Document.id)
+            .where(models.Document.workspace_name == workspace_name)
+            .where(models.Document.observer == observer)
+            .where(models.Document.observed == observed)
+            .where(models.Document.embedding.isnot(None))
+            .where(models.Document.deleted_at.is_(None))
+            .where(distance <= _SEMANTIC_DUP_MAX_DISTANCE)
+        )
+        leg = apply_filter(leg, models.Document, filters)
+        nearest = leg.order_by(distance).limit(_SEMANTIC_DUP_TOP_K).subquery()
+        legs.append(
+            cast(
+                "Select[tuple[int, str]]",
+                select(literal(index).label("batch_index"), nearest.c.id),
+            )
+        )
+
+    if not legs:
+        return candidates
+
+    result = await db.execute(union_all(*legs))
+    rows = cast("list[tuple[int, str]]", result.all())
+    for batch_index, document_id in rows:
+        candidates[batch_index].append(document_id)
+    return candidates
+
+
+async def _fetch_dup_candidates_by_id(
+    db: AsyncSession,
+    candidate_ids: list[list[str]],
+    workspace_name: str,
+    *,
+    observer: str,
+    observed: str,
+) -> dict[str, models.Document]:
+    """Load every dup candidate the batch referenced with a single query."""
+    unique_ids = list({doc_id for ids in candidate_ids for doc_id in ids})
+    if not unique_ids:
+        return {}
+    documents = await fetch_documents_by_ids(
+        db=db,
+        workspace_name=workspace_name,
+        observer=observer,
+        observed=observed,
+        document_ids=unique_ids,
+    )
+    return {document.id: document for document in documents}
+
+
+def _resolve_semantic_dup(
+    doc: schemas.DocumentCreate,
+    candidate_ids: list[str],
+    candidates_by_id: dict[str, models.Document],
+) -> tuple[SemanticRejectionResult, models.Document | None]:
+    """Classify a semantic duplicate against prefetched candidates.
+
+    Candidates were fetched for the batch as a whole, so the per-document merge
+    scope is applied here instead of in SQL. Ids stay in similarity order; the
+    closest in-scope candidate wins.
+    """
+    filters = _semantic_dup_filters(doc)
+    if filters is None:
+        return SemanticRejectionResult.NOT_DUPLICATE, None
+
+    for candidate_id in candidate_ids:
+        existing_doc = candidates_by_id.get(candidate_id)
+        if existing_doc is None:
+            continue
+        if not _matches_semantic_dup_filters(existing_doc, filters):
+            continue
+        return _score_semantic_dup(doc, existing_doc), existing_doc
+
+    return SemanticRejectionResult.NOT_DUPLICATE, None
+
+
+async def _semantic_dup_decision(
+    db: AsyncSession,
+    doc: schemas.DocumentCreate,
+    workspace_name: str,
+    *,
+    observer: str,
+    observed: str,
+    candidate_document_ids: list[str] | None = None,
+) -> tuple[SemanticRejectionResult, models.Document | None]:
+    """Classify a semantic duplicate without writing."""
+    filters = _semantic_dup_filters(doc)
+    if filters is None:
+        return SemanticRejectionResult.NOT_DUPLICATE, None
+
+    if candidate_document_ids is not None:
+        similar_docs: Sequence[models.Document] = await fetch_documents_by_ids(
+            db=db,
+            workspace_name=workspace_name,
+            observer=observer,
+            observed=observed,
+            document_ids=candidate_document_ids,
+            filters=filters,
+        )
+    elif _uses_pgvector():
+        if not doc.embedding:
+            # Match external-store path: never embed under an open session.
+            return SemanticRejectionResult.NOT_DUPLICATE, None
+        similar_docs = await query_documents(
+            db=db,
+            workspace_name=workspace_name,
+            query=doc.content,
+            observer=observer,
+            observed=observed,
+            filters=filters,
+            max_distance=_SEMANTIC_DUP_MAX_DISTANCE,
+            top_k=_SEMANTIC_DUP_TOP_K,
+            embedding=doc.embedding,
+        )
+    else:
+        return SemanticRejectionResult.NOT_DUPLICATE, None
+
+    if not similar_docs:
+        return SemanticRejectionResult.NOT_DUPLICATE, None
+
+    existing_doc = similar_docs[0]
+    return _score_semantic_dup(doc, existing_doc), existing_doc
+
+
 async def is_rejected_duplicate(
     db: AsyncSession,
     doc: schemas.DocumentCreate,
@@ -1112,78 +1636,30 @@ async def is_rejected_duplicate(
     *,
     observer: str,
     observed: str,
-) -> bool:
-    """
-    Check if a document is a duplicate of an existing document.
-
-    Uses: 1) Cosine similarity (>=0.95), 2) Token diff for retention.
-
-    Returns True if both:
-    - the document is deemed a duplicate of an existing document
-    - the existing document is deemed a superior duplicate
-
-    If the document is not a duplicate, returns False.
-
-    If the document is a duplicate AND the new document is superior,
-    deletes the existing document and returns False. In this case
-    ``doc.times_derived`` is updated in place to carry the replaced
-    document's reinforcement count forward.
-
-    If the document is a duplicate AND the existing document is superior,
-    increments the existing document's ``times_derived`` to record the
-    reinforcement, then returns True.
-    """
-    # Step 1: Find potential duplicates using cosine similarity
-    similar_docs = await query_documents(
-        db=db,
-        workspace_name=workspace_name,
-        query=doc.content,
+    candidate_document_ids: list[str] | None = None,
+) -> SemanticRejectionResult:
+    """Classify a semantic duplicate and apply the corresponding row write."""
+    result, existing_doc = await _semantic_dup_decision(
+        db,
+        doc,
+        workspace_name,
         observer=observer,
         observed=observed,
-        max_distance=0.05,
-        top_k=1,
-        embedding=doc.embedding,
+        candidate_document_ids=candidate_document_ids,
     )
-
-    if not similar_docs:
-        return False
-
-    existing_doc = similar_docs[0]
-
-    # Step 2: Determine which has more information using token set difference.
-    # This path only needs tokenization, so avoid instantiating the embedding
-    # transport client; duplicate detection must work in local/offline tests that
-    # provide an embedding directly without provider credentials.
-    encoding = get_embedding_encoding()
-    tokens_new = set(encoding.encode(doc.content))
-    tokens_existing = set(encoding.encode(existing_doc.content))
-
-    unique_new = len(tokens_new - tokens_existing)
-    unique_existing = len(tokens_existing - tokens_new)
-
-    score_new = len(tokens_new) + (unique_new * 10)
-    score_existing = len(tokens_existing) + (unique_existing * 10)
-
-    # If new document has more or equal information, keep it and delete existing
-    if score_new >= score_existing:
+    if existing_doc is None:
+        return result
+    if result is SemanticRejectionResult.REPLACED_EXISTING:
         logger.debug(
             "[DUPLICATE DETECTION] Deleting existing in favor of new. new=%r, existing=%r.",
             doc.content,
             existing_doc.content,
         )
-        # Carry the reinforcement count forward so replacing a duplicate counts as
-        # another derivation rather than resetting times_derived to 1.
         doc.times_derived = max(doc.times_derived, existing_doc.times_derived + 1)
         # Soft-delete the existing document - reconciliation will clean up vectors and hard-delete
-        existing_doc.deleted_at = datetime.datetime.now(datetime.timezone.utc)
+        existing_doc.deleted_at = datetime.datetime.now(datetime.UTC)
         await db.flush()
-        return False  # Don't reject the new document
-
-    # Existing document has more information, reject the new one but record the
-    # reinforcement: a semantic duplicate was derived again. greatest(...) keeps
-    # the increment atomic server-side -- concurrent workers reinforcing the same
-    # document must not lose updates -- while still honoring an incoming doc that
-    # already carries accumulated reinforcement (times_derived > 1).
+        return result
     existing_doc.times_derived = func.greatest(
         models.Document.times_derived + 1,
         doc.times_derived,
@@ -1194,7 +1670,7 @@ async def is_rejected_duplicate(
         doc.content,
         existing_doc.content,
     )
-    return True
+    return result
 
 
 async def cleanup_soft_deleted_documents(
@@ -1219,7 +1695,7 @@ async def cleanup_soft_deleted_documents(
     Returns:
         Count of documents cleaned up (only those where vector deletion succeeded).
     """
-    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+    cutoff = datetime.datetime.now(datetime.UTC) - datetime.timedelta(
         minutes=older_than_minutes
     )
 
@@ -1312,34 +1788,44 @@ async def get_documents_by_ids(
     return result.scalars().all()
 
 
-async def get_child_observations(
-    db: AsyncSession,
+def get_child_observations(
     workspace_name: str,
     parent_id: str,
     *,
     observer: str | None = None,
     observed: str | None = None,
-) -> Sequence[models.Document]:
+    reverse: bool = False,
+) -> Select[tuple[models.Document]]:
     """
     Get all observations that have this document as a source/premise.
 
-    Useful for traversing the reasoning tree upward (source -> derived observations).
-    Uses GIN index on source_ids for efficient lookups.
+    Useful for traversing the reasoning tree upward (source -> derived
+    observations). Matches through document_sources, falling back to the
+    legacy JSONB column for rows the reconciler has not drained yet.
 
     Args:
-        db: Database session
         workspace_name: Workspace identifier
         parent_id: Document ID to find children of
         observer: Optional filter by observer
         observed: Optional filter by observed
+        reverse: Whether to reverse the order (oldest first)
 
     Returns:
-        Sequence of documents that reference this document as a source
+        Select query for documents that reference this document as a source,
+        for pagination support via apaginate()
     """
-    # Find documents where source_ids contains the parent_id
+    linked = (
+        select(literal(1))
+        .where(
+            models.DocumentSource.derived_id == models.Document.id,
+            models.DocumentSource.source_id == parent_id,
+        )
+        .exists()
+    )
+    # Undrained rows still carry linkage in the legacy JSONB column.
     stmt = select(models.Document).where(
         models.Document.workspace_name == workspace_name,
-        models.Document.source_ids.contains([parent_id]),
+        or_(linked, models.Document.legacy_source_ids.contains([parent_id])),
         models.Document.deleted_at.is_(None),
     )
     if observer:
@@ -1347,5 +1833,13 @@ async def get_child_observations(
     if observed:
         stmt = stmt.where(models.Document.observed == observed)
 
-    result = await db.execute(stmt)
-    return result.scalars().all()
+    # created_at is the transaction timestamp, so documents created in the
+    # same batch share it -- id keeps pagination deterministic.
+    if reverse:
+        stmt = stmt.order_by(models.Document.created_at.asc(), models.Document.id.asc())
+    else:
+        stmt = stmt.order_by(
+            models.Document.created_at.desc(), models.Document.id.desc()
+        )
+
+    return stmt

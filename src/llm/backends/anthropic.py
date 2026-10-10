@@ -2,15 +2,26 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
 from anthropic.types import TextBlock, ThinkingBlock, ToolUseBlock
 from pydantic import BaseModel, ValidationError
 
+from src.exceptions import ValidationException
 from src.llm.backend import CompletionResult, StreamChunk, ToolCallResult
-from src.llm.request_builder import apply_sdk_passthroughs
-from src.llm.structured_output import repair_response_model_json
+from src.llm.request_builder import (
+    apply_sdk_passthroughs,
+    request_timeout_from_extra_params,
+)
+from src.llm.structured_output import repair_response_model_json, schema_instruction
+
+logger = logging.getLogger(__name__)
+
+THINKING_TOOL_CHOICE_CONFLICT_MODES = frozenset(
+    {"throw", "override_thinking", "override_tool"}
+)
 
 
 class AnthropicBackend:
@@ -61,11 +72,7 @@ class AnthropicBackend:
             converted_tool_choice = self._convert_tool_choice(tool_choice)
             if converted_tool_choice is not None:
                 params["tool_choice"] = converted_tool_choice
-        if thinking_budget_tokens:
-            params["thinking"] = {
-                "type": "enabled",
-                "budget_tokens": thinking_budget_tokens,
-            }
+        self._apply_thinking(params, model, thinking_budget_tokens, extra_params)
         if extra_params:
             for key in ("top_p", "top_k"):
                 if key in extra_params:
@@ -74,26 +81,32 @@ class AnthropicBackend:
             # from ModelConfig.provider_params. Shallow merge with operator-wins.
             apply_sdk_passthroughs(params, extra_params)
 
+        timeout = request_timeout_from_extra_params(extra_params)
+        if timeout is not None:
+            params["timeout"] = timeout
+
+        # The '{' prefill forces a JSON-first response, which suppresses
+        # tool_use blocks — skip it when tools are available and rely on the
+        # conditional instruction + repair fallback instead.
         use_json_prefill = (
             bool(response_format or self._json_mode(extra_params))
             and not thinking_budget_tokens
+            and not tools
             and self._supports_assistant_prefill(model)
         )
         if use_json_prefill and params["messages"]:
             if response_format and isinstance(response_format, type):
-                schema_json = json.dumps(response_format.model_json_schema(), indent=2)
                 self._append_text_to_last_message(
                     params["messages"],
-                    f"\n\nRespond with valid JSON matching this schema:\n{schema_json}",
+                    schema_instruction(response_format, tools_present=False),
                 )
             params["messages"].append({"role": "assistant", "content": "{"})
         elif (
             response_format and isinstance(response_format, type) and params["messages"]
         ):
-            schema_json = json.dumps(response_format.model_json_schema(), indent=2)
             self._append_text_to_last_message(
                 params["messages"],
-                f"\n\nRespond with valid JSON matching this schema:\n{schema_json}",
+                schema_instruction(response_format, tools_present=bool(tools)),
             )
 
         response = await self._client.messages.create(**params)
@@ -155,32 +168,34 @@ class AnthropicBackend:
             # Operator escape hatch: forward Anthropic SDK passthrough kwargs
             # from ModelConfig.provider_params. Shallow merge with operator-wins.
             apply_sdk_passthroughs(params, extra_params)
+
+        timeout = request_timeout_from_extra_params(extra_params)
+        if timeout is not None:
+            params["timeout"] = timeout
+
+        # See complete(): no '{' prefill when tools are available, so
+        # tool_use blocks stay reachable on the streamed path too.
         use_json_prefill = (
             bool(response_format or is_json_mode)
             and not thinking_budget_tokens
+            and not tools
             and self._supports_assistant_prefill(model)
         )
         if use_json_prefill and params["messages"]:
             if response_format and isinstance(response_format, type):
-                schema_json = json.dumps(response_format.model_json_schema(), indent=2)
                 self._append_text_to_last_message(
                     params["messages"],
-                    f"\n\nRespond with valid JSON matching this schema:\n{schema_json}",
+                    schema_instruction(response_format, tools_present=False),
                 )
             params["messages"].append({"role": "assistant", "content": "{"})
         elif (
             response_format and isinstance(response_format, type) and params["messages"]
         ):
-            schema_json = json.dumps(response_format.model_json_schema(), indent=2)
             self._append_text_to_last_message(
                 params["messages"],
-                f"\n\nRespond with valid JSON matching this schema:\n{schema_json}",
+                schema_instruction(response_format, tools_present=bool(tools)),
             )
-        if thinking_budget_tokens:
-            params["thinking"] = {
-                "type": "enabled",
-                "budget_tokens": thinking_budget_tokens,
-            }
+        self._apply_thinking(params, model, thinking_budget_tokens, extra_params)
 
         async with self._client.messages.stream(**params) as stream:
             async for chunk in stream:
@@ -251,7 +266,8 @@ class AnthropicBackend:
         )
 
         content: Any = text_content
-        if response_format is not None:
+        # Tool-call turns carry no consumable content
+        if response_format is not None and not tool_calls:
             raw_content = f"{{{text_content}" if prefilled_json else text_content
             try:
                 if prefilled_json:
@@ -278,6 +294,44 @@ class AnthropicBackend:
             thinking_blocks=thinking_full_blocks,
             raw_response=response,
         )
+
+    @staticmethod
+    def _apply_thinking(
+        params: dict[str, Any],
+        model: str,
+        thinking_budget_tokens: int | None,
+        extra_params: dict[str, Any] | None,
+    ) -> None:
+        """First message to certain models can't force thinking and ask for tool, so we leave
+        the resolution up to the caller.
+
+        https://platform.claude.com/docs/en/build-with-claude/thinking#thinking-with-tool-use
+        """
+
+        if not thinking_budget_tokens:
+            return
+        tool_choice = params.get("tool_choice")
+        if tool_choice is not None and tool_choice.get("type") in {"any", "tool"}:
+            mode = (extra_params or {}).get("thinking_tool_choice_conflict", "throw")
+            if mode not in THINKING_TOOL_CHOICE_CONFLICT_MODES:
+                expected = sorted(THINKING_TOOL_CHOICE_CONFLICT_MODES)
+                raise ValidationException(
+                    f"Unknown thinking_tool_choice_conflict mode {mode!r}; expected one of {expected}"
+                )
+            conflict = f"model {model}: tool_choice {tool_choice} forces tool use, "
+            conflict += "which Anthropic does not allow alongside extended thinking"
+            if mode == "throw":
+                raise ValidationException(f"Cannot send request to {conflict}")
+            if mode == "override_tool":
+                logger.warning("Relaxing tool_choice to auto for %s", conflict)
+                params["tool_choice"] = {"type": "auto"}
+            else:
+                logger.warning("Dropping extended thinking for %s", conflict)
+                return
+        params["thinking"] = {
+            "type": "enabled",
+            "budget_tokens": thinking_budget_tokens,
+        }
 
     @staticmethod
     def _supports_assistant_prefill(model: str) -> bool:

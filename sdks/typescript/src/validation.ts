@@ -104,6 +104,7 @@ export const PeerCardConfigSchema = z
   .object({
     use: z.boolean().nullable().optional(),
     create: z.boolean().nullable().optional(),
+    customInstructions: z.string().nullable().optional(),
   })
   .strict()
 
@@ -116,6 +117,7 @@ export const SummaryConfigSchema = z
     enabled: z.boolean().nullable().optional(),
     messagesPerShortSummary: z.number().int().min(10).nullable().optional(),
     messagesPerLongSummary: z.number().int().min(20).nullable().optional(),
+    customInstructions: z.string().nullable().optional(),
   })
   .strict()
 
@@ -126,6 +128,17 @@ export const SummaryConfigSchema = z
 export const DreamConfigSchema = z
   .object({
     enabled: z.boolean().nullable().optional(),
+    customInstructions: z.string().nullable().optional(),
+  })
+  .strict()
+
+/**
+ * Schema for dialectic configuration.
+ * Used in workspace and session configuration.
+ */
+export const DialecticConfigSchema = z
+  .object({
+    customInstructions: z.string().nullable().optional(),
   })
   .strict()
 
@@ -135,10 +148,12 @@ export const DreamConfigSchema = z
  */
 export const SessionConfigSchema = z
   .object({
+    customInstructions: z.string().nullable().optional(),
     reasoning: ReasoningConfigSchema.nullable().optional(),
     peerCard: PeerCardConfigSchema.nullable().optional(),
     summary: SummaryConfigSchema.nullable().optional(),
     dream: DreamConfigSchema.nullable().optional(),
+    dialectic: DialecticConfigSchema.nullable().optional(),
   })
   .strict()
 
@@ -158,6 +173,149 @@ export const SessionIdSchema = z
  * Strict helper: session ID as object.
  */
 const SessionIdObjectSchema = z.object({ id: SessionIdSchema })
+
+/**
+ * Reserved peer-name prefix the server uses to store a scope.
+ */
+const SCOPE_PEER_PREFIX = 'scope.'
+
+/**
+ * Scope IDs are stored as peer names with the reserved prefix prepended, so
+ * they must leave room for it within the 512-character peer name limit.
+ */
+const SCOPE_ID_MAX_LENGTH = 512 - SCOPE_PEER_PREFIX.length
+
+/**
+ * The scope ID rules, as a plain function rather than only a schema.
+ *
+ * Zod reports a failing union as a single `invalid_union` / "Invalid input"
+ * issue and buries the branch errors, so a schema alone cannot carry these
+ * messages out of `ScopeOptionSchema`. Keeping the rules callable lets both the
+ * bare schema and the union surface the same specific message.
+ *
+ * @returns The problems found, or an empty array when the ID is valid.
+ */
+function scopeIdIssues(value: string): string[] {
+  if (value.length < 1) {
+    return ['Scope ID must be a non-empty string']
+  }
+  if (value.length > SCOPE_ID_MAX_LENGTH) {
+    return [`Scope ID can be at most ${SCOPE_ID_MAX_LENGTH} characters`]
+  }
+  // Checked before the charset: the reserved prefix contains '.', which is
+  // itself outside the charset, so a charset-first check would report the
+  // charset instead of the real mistake for a double-prefixed name.
+  if (value.startsWith(SCOPE_PEER_PREFIX)) {
+    return [
+      `Scope ID must not start with the reserved prefix '${SCOPE_PEER_PREFIX}' (scope IDs are unprefixed)`,
+    ]
+  }
+  if (!/^[a-zA-Z0-9_-]+$/.test(value)) {
+    return [
+      'Scope ID may only contain letters, numbers, underscores, and hyphens',
+    ]
+  }
+  return []
+}
+
+/**
+ * Add every scope ID problem in `values` as a top-level issue.
+ */
+function addScopeIdIssues(values: string[], ctx: z.RefinementCtx): void {
+  for (const value of values) {
+    for (const message of scopeIdIssues(value)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message })
+    }
+  }
+}
+
+/**
+ * Schema for scope ID validation.
+ *
+ * Scope IDs are unprefixed — the `scope.` prefix is a server-side storage
+ * detail and never appears on the wire.
+ */
+export const ScopeIdSchema = z.string().superRefine((val, ctx) => {
+  addScopeIdIssues([val], ctx)
+})
+
+/**
+ * Shape-only branch for the `scope` option: an ID string, or an object carrying
+ * one (so a `Scope` instance is accepted). The ID itself is validated after the
+ * union resolves — see `ScopeOptionSchema`.
+ */
+const ScopeIdLikeSchema = z.union([z.string(), z.object({ id: z.string() })])
+
+/**
+ * Schema for the `scope` read option: one scope, or a bounded list of them.
+ *
+ * A single scope reads that scope's own view. A list restricts recall to the
+ * union of the scopes' member sessions. An empty list is rejected rather than
+ * resolved to an empty allowlist, which would silently recall nothing.
+ *
+ * The union discriminates shape only; IDs and list bounds are checked after the
+ * transform so their messages are not swallowed as `invalid_union`.
+ */
+export const ScopeOptionSchema = z
+  .union([ScopeIdLikeSchema, z.array(ScopeIdLikeSchema)])
+  .transform((val) =>
+    Array.isArray(val)
+      ? val.map((entry) => (typeof entry === 'string' ? entry : entry.id))
+      : typeof val === 'string'
+        ? val
+        : val.id
+  )
+  .superRefine((resolved, ctx) => {
+    if (Array.isArray(resolved)) {
+      if (resolved.length === 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'scope must name at least one scope',
+        })
+      }
+      if (resolved.length > 100) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'scope can name at most 100 scopes',
+        })
+      }
+    }
+    addScopeIdIssues(Array.isArray(resolved) ? resolved : [resolved], ctx)
+  })
+
+/**
+ * Schema for a scope membership change: the sessions to add to a scope.
+ *
+ * Capped at 100 to match the server rather than silently chunking, so a
+ * rejected batch is the batch the caller passed.
+ */
+export const ScopeSessionsSchema = z
+  .array(SessionIdSchema)
+  .min(1, 'At least one session must be given')
+  .max(100, 'At most 100 sessions can be added per call')
+
+/**
+ * Schema for the `scopes` option on session creation: the scopes a new session
+ * should join.
+ */
+export const SessionScopesSchema = z
+  .array(ScopeIdSchema)
+  .min(1, 'scopes must name at least one scope')
+  .max(100, 'scopes can name at most 100 scopes')
+
+/**
+ * Schema for the `sessions` allowlist option — sugar for the wire-level
+ * `filters: { session_id: [...] }`.
+ *
+ * Capped at 1,000 entries to match the server. An empty list is rejected: the
+ * server treats an empty allowlist as fail-closed (recalls nothing), which is
+ * never what a caller passing `sessions: []` intends.
+ */
+export const SessionAllowlistSchema = z
+  .array(z.union([SessionIdSchema, SessionIdObjectSchema]))
+  .min(1, 'sessions must name at least one session')
+  .max(1000, 'sessions can name at most 1000 sessions')
+  .transform((vals) => vals.map((v) => (typeof v === 'string' ? v : v.id)))
 
 /**
  * Schema for session peer configuration.
@@ -292,6 +450,58 @@ export function normalizeListOptions<T extends { filters?: Filters }>(
 }
 
 /**
+ * Translate validated `scope` / `sessions` options into their wire fields.
+ *
+ * `sessions` is sugar: it goes out as the constrained
+ * `filters: { session_id: [...] }` body the recall endpoints accept, never as a
+ * field of its own — the server rejects unknown keys with a 422. Shared by chat,
+ * chatStream, and representation so the three cannot drift apart.
+ *
+ * Purely a translation; the schemas have already rejected the invalid
+ * combinations by the time this runs.
+ */
+export function scopeRecallFields(options: {
+  scope?: string | string[]
+  sessions?: string[]
+}): { scope?: string | string[]; filters?: Record<string, unknown> } {
+  return {
+    scope: options.scope,
+    filters: options.sessions ? { session_id: options.sessions } : undefined,
+  }
+}
+
+/**
+ * Add issues for the `scope` exclusions the server enforces with a 422.
+ *
+ * A scope already determines what a query can see, so combining it with a
+ * session allowlist or a single session is a contradiction rather than a
+ * narrowing. Shared by the chat, representation, and context schemas so the
+ * three surfaces cannot drift apart.
+ */
+function scopeExclusivityIssues(
+  data: { scope?: unknown; sessions?: unknown; session?: unknown },
+  ctx: z.RefinementCtx
+): void {
+  if (data.scope === undefined) {
+    return
+  }
+  if (data.sessions !== undefined) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'scope and sessions are mutually exclusive',
+      path: ['sessions'],
+    })
+  }
+  if (data.session !== undefined) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'scope and session are mutually exclusive',
+      path: ['session'],
+    })
+  }
+}
+
+/**
  * Schema for chat query parameters.
  */
 export const ChatQuerySchema = z
@@ -309,11 +519,20 @@ export const ChatQuerySchema = z
       .transform((val) =>
         val ? (typeof val === 'string' ? val : val.id) : undefined
       ),
+    scope: ScopeOptionSchema.optional(),
+    sessions: SessionAllowlistSchema.optional(),
     reasoningLevel: z
       .enum(['minimal', 'low', 'medium', 'high', 'max'])
       .optional(),
+    // A Zod schema (checked first — it is itself an object) or a raw JSON
+    // Schema object describing the desired response structure.
+    responseFormat: z
+      .union([z.instanceof(z.ZodType), z.record(z.string(), z.unknown())])
+      .optional(),
+    includeEvidence: z.boolean().optional(),
   })
   .strict()
+  .superRefine(scopeExclusivityIssues)
 
 /**
  * Schema for representation options.
@@ -351,11 +570,40 @@ export const ContextParamsSchema = z
     tokens: z.int('Token limit must be an integer').optional(),
     peerTarget: PeerIdSchema.optional(),
     peerPerspective: PeerIdSchema.optional(),
+    // Only a single scope is accepted here: the context route uses a scope as
+    // the *perspective source* for the target's representation and card, which
+    // is one observer. A list of scopes has no meaning for that.
+    scope: ScopeIdSchema.optional(),
+    sessions: SessionAllowlistSchema.optional(),
     limitToSession: z.boolean().optional(),
     representationOptions: RepresentationOptionsSchema.optional(),
   })
   .strict()
   .superRefine((data, ctx) => {
+    if (data.sessions && !data.peerTarget) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'peerTarget is required when sessions is provided',
+        path: ['sessions'],
+      })
+    }
+
+    if (data.sessions && data.scope) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'sessions and scope are mutually exclusive',
+        path: ['sessions'],
+      })
+    }
+
+    if (data.sessions && data.limitToSession) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'sessions and limitToSession are mutually exclusive',
+        path: ['sessions'],
+      })
+    }
+
     if (data.representationOptions?.searchQuery && !data.peerTarget) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -369,6 +617,22 @@ export const ContextParamsSchema = z
         code: z.ZodIssueCode.custom,
         message: 'peerTarget is required when peerPerspective is provided',
         path: ['peerPerspective'],
+      })
+    }
+
+    if (data.scope && !data.peerTarget) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'peerTarget is required when scope is provided',
+        path: ['scope'],
+      })
+    }
+
+    if (data.scope && data.peerPerspective) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'scope and peerPerspective are mutually exclusive',
+        path: ['scope'],
       })
     }
   })
@@ -432,10 +696,13 @@ export const GetRepresentationParamsSchema = z
 export const PeerGetRepresentationParamsSchema = z
   .object({
     session: z.union([SessionIdSchema, SessionIdObjectSchema]).optional(),
+    scope: ScopeOptionSchema.optional(),
+    sessions: SessionAllowlistSchema.optional(),
     target: z.union([PeerIdSchema, PeerIdObjectSchema]).optional(),
     options: RepresentationOptionsSchema.optional(),
   })
   .strict()
+  .superRefine(scopeExclusivityIssues)
 
 /**
  * Schema for peer card target parameter.
@@ -532,6 +799,7 @@ export type ReasoningConfigApi = {
 export type PeerCardConfigApi = {
   use?: boolean | null
   create?: boolean | null
+  custom_instructions?: string | null
 }
 
 /**
@@ -541,6 +809,7 @@ export type SummaryConfigApi = {
   enabled?: boolean | null
   messages_per_short_summary?: number | null
   messages_per_long_summary?: number | null
+  custom_instructions?: string | null
 }
 
 /**
@@ -548,16 +817,26 @@ export type SummaryConfigApi = {
  */
 export type DreamConfigApi = {
   enabled?: boolean | null
+  custom_instructions?: string | null
+}
+
+/**
+ * API format for dialectic config (snake_case).
+ */
+export type DialecticConfigApi = {
+  custom_instructions?: string | null
 }
 
 /**
  * API format for workspace configuration (snake_case).
  */
 export type WorkspaceConfigApi = {
+  custom_instructions?: string | null
   reasoning?: ReasoningConfigApi | null
   peer_card?: PeerCardConfigApi | null
   summary?: SummaryConfigApi | null
   dream?: DreamConfigApi | null
+  dialectic?: DialecticConfigApi | null
 }
 
 /**
@@ -614,13 +893,14 @@ function reasoningConfigFromApi(
  * Transform peer card config to API format.
  */
 function peerCardConfigToApi(
-  config: { use?: boolean | null; create?: boolean | null } | null | undefined
+  config: PeerCardConfig | null | undefined
 ): PeerCardConfigApi | null | undefined {
   if (config === null) return null
   if (config === undefined) return undefined
   return {
     use: config.use,
     create: config.create,
+    custom_instructions: config.customInstructions,
   }
 }
 
@@ -629,12 +909,13 @@ function peerCardConfigToApi(
  */
 function peerCardConfigFromApi(
   config: PeerCardConfigApi | null | undefined
-): { use?: boolean | null; create?: boolean | null } | null | undefined {
+): PeerCardConfig | null | undefined {
   if (config === null) return null
   if (config === undefined) return undefined
   return {
     use: config.use,
     create: config.create,
+    customInstructions: config.custom_instructions,
   }
 }
 
@@ -642,14 +923,7 @@ function peerCardConfigFromApi(
  * Transform summary config to API format.
  */
 function summaryConfigToApi(
-  config:
-    | {
-        enabled?: boolean | null
-        messagesPerShortSummary?: number | null
-        messagesPerLongSummary?: number | null
-      }
-    | null
-    | undefined
+  config: SummaryConfig | null | undefined
 ): SummaryConfigApi | null | undefined {
   if (config === null) return null
   if (config === undefined) return undefined
@@ -657,26 +931,23 @@ function summaryConfigToApi(
     enabled: config.enabled,
     messages_per_short_summary: config.messagesPerShortSummary,
     messages_per_long_summary: config.messagesPerLongSummary,
+    custom_instructions: config.customInstructions,
   }
 }
 
 /**
  * Transform summary config from API format.
  */
-function summaryConfigFromApi(config: SummaryConfigApi | null | undefined):
-  | {
-      enabled?: boolean | null
-      messagesPerShortSummary?: number | null
-      messagesPerLongSummary?: number | null
-    }
-  | null
-  | undefined {
+function summaryConfigFromApi(
+  config: SummaryConfigApi | null | undefined
+): SummaryConfig | null | undefined {
   if (config === null) return null
   if (config === undefined) return undefined
   return {
     enabled: config.enabled,
     messagesPerShortSummary: config.messages_per_short_summary,
     messagesPerLongSummary: config.messages_per_long_summary,
+    customInstructions: config.custom_instructions,
   }
 }
 
@@ -684,12 +955,13 @@ function summaryConfigFromApi(config: SummaryConfigApi | null | undefined):
  * Transform dream config to API format.
  */
 function dreamConfigToApi(
-  config: { enabled?: boolean | null } | null | undefined
+  config: DreamConfig | null | undefined
 ): DreamConfigApi | null | undefined {
   if (config === null) return null
   if (config === undefined) return undefined
   return {
     enabled: config.enabled,
+    custom_instructions: config.customInstructions,
   }
 }
 
@@ -698,11 +970,38 @@ function dreamConfigToApi(
  */
 function dreamConfigFromApi(
   config: DreamConfigApi | null | undefined
-): { enabled?: boolean | null } | null | undefined {
+): DreamConfig | null | undefined {
   if (config === null) return null
   if (config === undefined) return undefined
   return {
     enabled: config.enabled,
+    customInstructions: config.custom_instructions,
+  }
+}
+
+/**
+ * Transform dialectic config to API format.
+ */
+function dialecticConfigToApi(
+  config: DialecticConfig | null | undefined
+): DialecticConfigApi | null | undefined {
+  if (config === null) return null
+  if (config === undefined) return undefined
+  return {
+    custom_instructions: config.customInstructions,
+  }
+}
+
+/**
+ * Transform dialectic config from API format.
+ */
+function dialecticConfigFromApi(
+  config: DialecticConfigApi | null | undefined
+): DialecticConfig | null | undefined {
+  if (config === null) return null
+  if (config === undefined) return undefined
+  return {
+    customInstructions: config.custom_instructions,
   }
 }
 
@@ -714,10 +1013,12 @@ export function workspaceConfigToApi(
 ): WorkspaceConfigApi | undefined {
   if (!config) return undefined
   return {
+    custom_instructions: config.customInstructions,
     reasoning: reasoningConfigToApi(config.reasoning),
     peer_card: peerCardConfigToApi(config.peerCard),
     summary: summaryConfigToApi(config.summary),
     dream: dreamConfigToApi(config.dream),
+    dialectic: dialecticConfigToApi(config.dialectic),
   }
 }
 
@@ -730,10 +1031,12 @@ export function workspaceConfigFromApi(
   if (!config) return undefined
   const apiConfig = config as WorkspaceConfigApi
   return {
+    customInstructions: apiConfig.custom_instructions,
     reasoning: reasoningConfigFromApi(apiConfig.reasoning),
     peerCard: peerCardConfigFromApi(apiConfig.peer_card),
     summary: summaryConfigFromApi(apiConfig.summary),
     dream: dreamConfigFromApi(apiConfig.dream),
+    dialectic: dialecticConfigFromApi(apiConfig.dialectic),
   }
 }
 
@@ -745,10 +1048,12 @@ export function sessionConfigToApi(
 ): SessionConfigApi | undefined {
   if (!config) return undefined
   return {
+    custom_instructions: config.customInstructions,
     reasoning: reasoningConfigToApi(config.reasoning),
     peer_card: peerCardConfigToApi(config.peerCard),
     summary: summaryConfigToApi(config.summary),
     dream: dreamConfigToApi(config.dream),
+    dialectic: dialecticConfigToApi(config.dialectic),
   }
 }
 
@@ -761,10 +1066,12 @@ export function sessionConfigFromApi(
   if (!config) return undefined
   const apiConfig = config as SessionConfigApi
   return {
+    customInstructions: apiConfig.custom_instructions,
     reasoning: reasoningConfigFromApi(apiConfig.reasoning),
     peerCard: peerCardConfigFromApi(apiConfig.peer_card),
     summary: summaryConfigFromApi(apiConfig.summary),
     dream: dreamConfigFromApi(apiConfig.dream),
+    dialectic: dialecticConfigFromApi(apiConfig.dialectic),
   }
 }
 
@@ -908,10 +1215,12 @@ export const WorkspaceMetadataSchema = z.record(z.string(), z.unknown())
  */
 export const WorkspaceConfigSchema = z
   .object({
+    customInstructions: z.string().nullable().optional(),
     reasoning: ReasoningConfigSchema.nullable().optional(),
     peerCard: PeerCardConfigSchema.nullable().optional(),
     summary: SummaryConfigSchema.nullable().optional(),
     dream: DreamConfigSchema.nullable().optional(),
+    dialectic: DialecticConfigSchema.nullable().optional(),
   })
   .strict()
 
@@ -977,6 +1286,7 @@ export type ReasoningConfig = z.infer<typeof ReasoningConfigSchema>
 export type PeerCardConfig = z.infer<typeof PeerCardConfigSchema>
 export type SummaryConfig = z.infer<typeof SummaryConfigSchema>
 export type DreamConfig = z.infer<typeof DreamConfigSchema>
+export type DialecticConfig = z.infer<typeof DialecticConfigSchema>
 export type MessageConfiguration = z.infer<typeof MessageConfigurationSchema>
 export type Limit = z.infer<typeof LimitSchema>
 export type ConclusionQueryParams = z.infer<typeof ConclusionQueryParamsSchema>

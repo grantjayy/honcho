@@ -10,10 +10,10 @@ from typing import ClassVar
 
 from pydantic import Field
 
-from src.telemetry.events.base import BaseEvent
+from src.telemetry.events.base import BaseEvent, CustomInstructionsFields
 
 
-class RepresentationCompletedEvent(BaseEvent):
+class RepresentationCompletedEvent(BaseEvent, CustomInstructionsFields):
     """Emitted when a representation task completes processing a message batch.
 
     Representation tasks extract conclusions from messages to build peer
@@ -100,6 +100,31 @@ class RepresentationCompletedEvent(BaseEvent):
         default=0,
         description="Estimated tokens for the system/scaffold portion of the prompt",
     )
+    exact_dup_in_batch_count: int = Field(
+        default=0,
+        description="Number of documents produced in this representation that had the same normalized content",
+    )
+    exact_dup_existing_count: int = Field(
+        default=0,
+        description=(
+            "Number of documents previously written that had a representation that had the same normalized "
+            "content as a document in this representation"
+        ),
+    )
+    semantic_dup_rejected_count: int = Field(
+        default=0,
+        description=(
+            "Number of documents in this representation rejected because their cosine-similarity was high "
+            "for an existing document but were worse than the corresponding existing document"
+        ),
+    )
+    semantic_dup_replaced_count: int = Field(
+        default=0,
+        description=(
+            "Number of documents in this representation that replaced existing documents because their "
+            "cosine-similarity was high and they were better than the corresponding existing document"
+        ),
+    )
 
     # Cap configuration + hit flags ()
     batch_max_tokens: int = Field(
@@ -128,6 +153,10 @@ class RepresentationCompletedEvent(BaseEvent):
     observer_count: int = Field(
         default=0,
         description="Number of observers this representation was saved against",
+    )
+    failed_observer_count: int = Field(
+        default=0,
+        description="Number of observers whose save_representation failed (partial or total)",
     )
 
     def get_resource_id(self) -> str:

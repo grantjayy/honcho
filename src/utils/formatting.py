@@ -5,7 +5,7 @@ This module contains helper functions for processing observations, formatting co
 handling temporal metadata, and string escaping for the reasoning system.
 """
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 ILIKE_ESCAPE_CHAR = "\\"
 
@@ -63,11 +63,11 @@ def format_datetime_utc(dt: datetime) -> str:
     """
     if dt.tzinfo is None:
         # If no timezone info, assume UTC
-        dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
 
     # Convert to UTC if not already
-    if dt.tzinfo != timezone.utc:
-        dt = dt.astimezone(timezone.utc)
+    if dt.tzinfo != UTC:
+        dt = dt.astimezone(UTC)
 
     # Remove subsecond precision
     dt = dt.replace(microsecond=0)
@@ -88,7 +88,7 @@ def utc_now_iso() -> str:
         >>> utc_now_iso()
         '2023-01-01T12:34:56Z'
     """
-    return format_datetime_utc(datetime.now(timezone.utc))
+    return format_datetime_utc(datetime.now(UTC))
 
 
 def parse_datetime_iso(iso_string: str) -> datetime:
@@ -142,7 +142,7 @@ def parse_datetime_iso(iso_string: str) -> datetime:
 
         # If no timezone info, assume UTC
         if result.tzinfo is None:
-            result = result.replace(tzinfo=timezone.utc)
+            result = result.replace(tzinfo=UTC)
 
         return result
     except ValueError as e:
@@ -165,3 +165,27 @@ def format_new_turn_with_timestamp(
     """
     current_time_str = current_time.strftime("%Y-%m-%d %H:%M:%S")
     return f"{current_time_str} {speaker}: {new_turn}"
+
+
+def custom_instructions_section(
+    custom_instructions: str | None,
+    *,
+    heading: str = "CUSTOM INSTRUCTIONS:",
+    note: str | None = None,
+) -> str:
+    """
+    Render operator-configured custom instructions as a prompt section.
+
+    Args:
+        custom_instructions: Resolved instructions; blank or None renders nothing
+        heading: Section heading line
+        note: Optional line between the heading and the instructions
+
+    Returns:
+        The rendered section, or an empty string when there are no instructions
+    """
+    normalized = (custom_instructions or "").strip()
+    if not normalized:
+        return ""
+    lines = [heading, note, normalized] if note else [heading, normalized]
+    return "\n".join(lines)
