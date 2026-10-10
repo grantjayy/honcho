@@ -31,6 +31,7 @@ from src.schemas import (
 from src.telemetry.prometheus.metrics import (
     deriver_tokens_processed_counter,
     dialectic_tokens_processed_counter,
+    summary_rejections_counter,
 )
 from src.utils.representation import ExplicitObservationBase, PromptRepresentation
 from src.utils.summarizer import (
@@ -79,9 +80,9 @@ class PrometheusMetricChecker:
     ) -> None:
         """Assert that the delta matches expected value."""
         delta = self.get_delta(counter, labels, before)
-        assert (
-            delta == expected
-        ), f"{message}: expected delta {expected}, got {delta}. Labels: {labels}"
+        assert delta == expected, (
+            f"{message}: expected delta {expected}, got {delta}. Labels: {labels}"
+        )
 
 
 @pytest.fixture
@@ -386,6 +387,76 @@ class TestDeriverIngestionMetrics:
 
 
 # =============================================================================
+# Summary degeneration guard (#899)
+# =============================================================================
+
+_DEGENERATE_SUMMARY_TEXT = "Human. Forever. Human. Always. Human value. Always. " * 300
+
+
+@pytest.mark.asyncio
+class TestSummaryDegenerationGuard:
+    """Persistence-boundary tests for the #899 degeneration guard."""
+
+    async def test_degenerate_cap_hit_does_not_save_summary(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[Workspace, Peer],
+        prometheus_test_setup: PrometheusMetricChecker,
+    ):
+        """Degenerate max_tokens summary must not call _save_summary and must count rejection."""
+        metric_checker = prometheus_test_setup
+        workspace, peer = sample_data
+        session = await create_test_session_with_peer(db_session, workspace, peer)
+        messages = await create_test_messages(
+            db_session, workspace.name, session.name, peer.name, count=5
+        )
+        last_message = messages[-1]
+
+        mock_response = HonchoLLMCallResponse(
+            content=_DEGENERATE_SUMMARY_TEXT,
+            input_tokens=20000,
+            output_tokens=4000,
+            finish_reasons=["max_tokens"],
+        )
+
+        rejection_labels = {
+            "namespace": "test",
+            "summary_type": "long",
+            "reason": "degenerate_repetition",
+        }
+        before = metric_checker.capture(summary_rejections_counter, rejection_labels)
+
+        with (
+            patch(
+                "src.utils.summarizer.create_long_summary",
+                new=AsyncMock(return_value=mock_response),
+            ),
+            patch(
+                "src.utils.summarizer._save_summary",
+                new=AsyncMock(),
+            ) as mock_save,
+        ):
+            await _create_and_save_summary(
+                workspace_name=workspace.name,
+                session_name=session.name,
+                message_id=last_message.id,
+                message_seq_in_session=last_message.seq_in_session,
+                summary_type=SummaryType.LONG,
+                message_public_id=last_message.public_id,
+                configuration=create_test_configuration(),
+            )
+
+        mock_save.assert_not_awaited()
+        metric_checker.assert_delta(
+            summary_rejections_counter,
+            rejection_labels,
+            before,
+            1,
+            "Summary rejection counter",
+        )
+
+
+# =============================================================================
 # Deriver Summary Metrics Tests
 # =============================================================================
 
@@ -591,9 +662,9 @@ class TestDeriverSummaryMetrics:
         delta = metric_checker.get_delta(
             deriver_tokens_processed_counter, labels, before
         )
-        assert (
-            delta == expected_messages_tokens
-        ), f"Expected messages input tokens {expected_messages_tokens}, got {delta}"
+        assert delta == expected_messages_tokens, (
+            f"Expected messages input tokens {expected_messages_tokens}, got {delta}"
+        )
         assert delta > 0, "Expected at least some message tokens to be tracked"
 
     async def test_summary_fallback_does_not_track(
@@ -663,12 +734,12 @@ class TestDeriverSummaryMetrics:
             deriver_tokens_processed_counter, prompt_labels, before_prompt
         )
 
-        assert (
-            output_delta == 0
-        ), f"Expected no output token change on fallback, got {output_delta}"
-        assert (
-            prompt_delta == 0
-        ), f"Expected no prompt token change on fallback, got {prompt_delta}"
+        assert output_delta == 0, (
+            f"Expected no output token change on fallback, got {output_delta}"
+        )
+        assert prompt_delta == 0, (
+            f"Expected no prompt token change on fallback, got {prompt_delta}"
+        )
 
 
 # =============================================================================
@@ -837,9 +908,9 @@ class TestDialecticTokenMetrics:
             dialectic_tokens_processed_counter, output_labels, before_output
         )
 
-        assert (
-            input_delta == 0
-        ), f"Expected no input token change when disabled, got {input_delta}"
-        assert (
-            output_delta == 0
-        ), f"Expected no output token change when disabled, got {output_delta}"
+        assert input_delta == 0, (
+            f"Expected no input token change when disabled, got {input_delta}"
+        )
+        assert output_delta == 0, (
+            f"Expected no output token change when disabled, got {output_delta}"
+        )

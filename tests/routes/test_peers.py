@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi.testclient import TestClient
 from nanoid import generate as generate_nanoid
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src import crud, models
@@ -226,9 +227,7 @@ async def test_get_peers_reverse_uses_id_tiebreaker(
     """Peers with identical created_at fall back to ordering by id (nanoid PK)."""
     test_workspace, _ = sample_data
     reverse_group = f"tiebreaker-peers-{generate_nanoid()}"
-    shared_created_at = datetime.datetime(
-        2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc
-    )
+    shared_created_at = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.UTC)
 
     low_id = "A" * 21
     high_id = "z" * 21
@@ -515,9 +514,7 @@ async def test_get_sessions_for_peer_reverse_uses_id_tiebreaker(
     """Peer-scoped sessions with identical created_at fall back to ordering by id."""
     test_workspace, test_peer = sample_data
     reverse_group = f"tiebreaker-peer-sessions-{generate_nanoid()}"
-    shared_created_at = datetime.datetime(
-        2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc
-    )
+    shared_created_at = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.UTC)
 
     low_id = "A" * 21
     high_id = "z" * 21
@@ -1377,3 +1374,191 @@ def test_set_peer_card(client: TestClient, sample_data: tuple[Workspace, Peer]):
     )
     assert response.status_code == 200
     assert response.json()["peer_card"] == target_card
+
+
+FOOD_PREFS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "preferences": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "food": {"type": "string"},
+                    "sentiment": {"enum": ["loves", "likes", "dislikes"]},
+                },
+                "required": ["food", "sentiment"],
+            },
+        },
+        "summary": {"type": "string"},
+    },
+    "required": ["preferences", "summary"],
+}
+
+
+def test_chat_with_response_format(
+    client: TestClient,
+    sample_data: tuple[Workspace, Peer],
+    mock_llm_call_functions: dict[str, Any],
+):
+    """A valid response_format converts to a Pydantic model and is passed to
+    the dialectic as response_model."""
+    test_workspace, test_peer = sample_data
+
+    response = client.post(
+        f"/v3/workspaces/{test_workspace.name}/peers/{test_peer.name}/chat",
+        json={
+            "query": "What are this user's food preferences?",
+            "stream": False,
+            "response_format": FOOD_PREFS_SCHEMA,
+        },
+    )
+    assert response.status_code == 200
+    assert "content" in response.json()
+
+    kwargs = mock_llm_call_functions["agentic_chat"].await_args.kwargs
+    response_model = kwargs["response_model"]
+    assert isinstance(response_model, type)
+    assert issubclass(response_model, BaseModel)
+    # The converted model enforces the caller's schema.
+    instance = response_model.model_validate(
+        {"preferences": [{"food": "sushi", "sentiment": "loves"}], "summary": "s"}
+    )
+    assert instance.summary == "s"  # pyright: ignore
+
+
+def test_chat_with_response_format_streaming(
+    client: TestClient,
+    sample_data: tuple[Workspace, Peer],
+    mock_llm_call_functions: dict[str, Any],
+):
+    test_workspace, test_peer = sample_data
+
+    response = client.post(
+        f"/v3/workspaces/{test_workspace.name}/peers/{test_peer.name}/chat",
+        json={
+            "query": "What are this user's food preferences?",
+            "stream": True,
+            "response_format": FOOD_PREFS_SCHEMA,
+        },
+    )
+    assert response.status_code == 200
+    assert "data:" in response.text
+
+    kwargs = mock_llm_call_functions["agentic_chat_stream"].call_args.kwargs
+    response_model = kwargs["response_model"]
+    assert isinstance(response_model, type)
+    assert issubclass(response_model, BaseModel)
+
+
+@pytest.mark.parametrize(
+    "bad_schema",
+    [
+        {"type": "string"},  # non-object root
+        {"type": "object", "properties": {"a": {"$ref": "#/x"}}},
+        {"type": "object", "properties": {"a": {"allOf": [{"type": "string"}]}}},
+        {
+            "type": "object",
+            "properties": {
+                "m": {"type": "object", "additionalProperties": {"type": "string"}}
+            },
+        },
+    ],
+)
+def test_chat_with_invalid_response_format(
+    client: TestClient,
+    sample_data: tuple[Workspace, Peer],
+    mock_llm_call_functions: dict[str, Any],
+    bad_schema: dict[str, Any],
+):
+    """Unsupported schemas are rejected with 422 before the dialectic runs."""
+    test_workspace, test_peer = sample_data
+
+    response = client.post(
+        f"/v3/workspaces/{test_workspace.name}/peers/{test_peer.name}/chat",
+        json={
+            "query": "Hello?",
+            "stream": False,
+            "response_format": bad_schema,
+        },
+    )
+    assert response.status_code == 422
+    assert "Invalid response_format" in response.json()["detail"]
+    mock_llm_call_functions["agentic_chat"].assert_not_awaited()
+
+
+def _get_search_context(
+    client: TestClient, workspace: Workspace, peer: Peer, route: str, query: str
+):
+    base = f"/v3/workspaces/{workspace.name}"
+    if route == "peer_context":
+        return client.get(
+            f"{base}/peers/{peer.name}/context", params={"search_query": query}
+        )
+    if route == "peer_representation":
+        return client.post(
+            f"{base}/peers/{peer.name}/representation", json={"search_query": query}
+        )
+    session_id = str(generate_nanoid())
+    client.post(f"{base}/sessions", json={"id": session_id, "peers": {peer.name: {}}})
+    return client.get(
+        f"{base}/sessions/{session_id}/context",
+        params={"peer_target": peer.name, "search_query": query},
+    )
+
+
+@pytest.mark.parametrize("route", ["peer_context", "peer_representation", "session"])
+def test_oversized_search_query_is_truncated_before_embedding(
+    client: TestClient,
+    sample_data: tuple[Workspace, Peer],
+    mock_openai_embeddings: dict[str, Any],
+    route: str,
+):
+    """An over-limit search_query is truncated once, not rejected and re-embedded."""
+    from src.embedding_client import EmbeddingTokenLimitError
+
+    test_workspace, test_peer = sample_data
+    limit = 10
+    long_query = "x" * (limit * 5)
+
+    mock_embed = mock_openai_embeddings["embed"]
+    default_embed = mock_embed.side_effect
+
+    def strict_embed(query: str) -> list[float]:
+        if len(query) > limit:
+            raise EmbeddingTokenLimitError("too long")
+        return default_embed(query)
+
+    mock_embed.side_effect = strict_embed
+
+    def truncate(text: str) -> str:
+        return text[:limit]
+
+    mock_openai_embeddings["truncate_to_token_limit"].side_effect = truncate
+
+    response = _get_search_context(client, test_workspace, test_peer, route, long_query)
+
+    assert response.status_code == 200
+    mock_embed.assert_called_once_with(long_query[:limit])
+
+
+@pytest.mark.parametrize("route", ["peer_context", "peer_representation", "session"])
+def test_search_query_truncation_failure_degrades(
+    client: TestClient,
+    sample_data: tuple[Workspace, Peer],
+    mock_openai_embeddings: dict[str, Any],
+    route: str,
+):
+    """A truncation failure (e.g. tiktoken rejecting a special token) degrades to
+    non-semantic retrieval instead of failing the request or re-embedding."""
+    test_workspace, test_peer = sample_data
+    mock_openai_embeddings["truncate_to_token_limit"].side_effect = ValueError(
+        "disallowed special token"
+    )
+
+    response = _get_search_context(
+        client, test_workspace, test_peer, route, "<|endoftext|>"
+    )
+
+    assert response.status_code == 200
+    mock_openai_embeddings["embed"].assert_not_called()

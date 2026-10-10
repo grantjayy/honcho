@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -13,6 +14,30 @@ logger = getLogger(__name__)
 VOYAGE_RERANK_URL = "https://api.voyageai.com/v1/rerank"
 DEFAULT_RERANK_MODEL = "rerank-2.5"
 DEFAULT_RERANK_TIMEOUT_SECONDS = 3.0
+
+# One client per process keeps the TLS connection to Voyage open between
+# calls instead of paying a new handshake on every rerank.
+_client: httpx.AsyncClient | None = None
+_client_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    """Return the shared client, replacing it if it is closed or belongs to
+    another (for example a closed) event loop."""
+    global _client, _client_loop
+    loop = asyncio.get_running_loop()
+    if _client is None or _client_loop is not loop or _client.is_closed:
+        _client = httpx.AsyncClient(timeout=DEFAULT_RERANK_TIMEOUT_SECONDS)
+        _client_loop = loop
+    return _client
+
+
+async def close_rerank_client() -> None:
+    """Close the shared client. Call from app shutdown on its owning loop."""
+    global _client, _client_loop
+    client, _client, _client_loop = _client, None, None
+    if client is not None and not client.is_closed:
+        await client.aclose()
 
 
 @dataclass(frozen=True)
@@ -44,25 +69,27 @@ async def rerank_texts(
         return None
 
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(
-                VOYAGE_RERANK_URL,
-                headers={"Authorization": f"Bearer {api_key}"},
-                json={
-                    "model": model,
-                    "query": query,
-                    "documents": list(documents),
-                    "top_k": min(top_k, len(documents)),
-                },
-            )
-            response.raise_for_status()
-            payload: object = response.json()
+        response = await _get_client().post(
+            VOYAGE_RERANK_URL,
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "model": model,
+                "query": query,
+                "documents": list(documents),
+                "top_k": min(top_k, len(documents)),
+            },
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        payload: object = response.json()
     except Exception as exc:
         logger.info("Voyage rerank unavailable; falling back to vector order: %s", exc)
         return None
 
     results_obj: object = (
-        cast(dict[str, object], payload).get("data") if isinstance(payload, dict) else None
+        cast(dict[str, object], payload).get("data")
+        if isinstance(payload, dict)
+        else None
     )
     if not isinstance(results_obj, list):
         return None
