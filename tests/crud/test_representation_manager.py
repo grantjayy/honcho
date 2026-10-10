@@ -540,6 +540,48 @@ class TestRepresentationManagerSessionScoping:
         assert mock_internal.await_args.kwargs["semantic_rerank"] is False
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("with_db", [True, False])
+    async def test_reranked_precompute_failure_degrades_to_other_context(
+        self, with_db: bool
+    ):
+        """A failed reranked semantic read must not abort the request; it
+        degrades like the non-rerank semantic path and is not retried."""
+        manager = RepresentationManager(
+            "workspace", observer="observer", observed="observed"
+        )
+
+        with (
+            patch(
+                "src.crud.query_documents",
+                new=AsyncMock(side_effect=RuntimeError("statement timeout")),
+            ) as mock_query,
+            patch.object(
+                manager,
+                "_get_working_representation_internal",
+                new=AsyncMock(return_value=Representation()),
+            ) as mock_internal,
+            patch("src.crud.representation.tracked_db") as mock_tracked_db,
+        ):
+            mock_tracked_db.return_value.__aenter__ = AsyncMock(
+                return_value=MagicMock(spec=AsyncSession)
+            )
+            mock_tracked_db.return_value.__aexit__ = AsyncMock(return_value=None)
+            result = await manager.get_working_representation(
+                db=MagicMock(spec=AsyncSession) if with_db else None,
+                include_semantic_query="anything",
+                embedding=[0.1],
+                semantic_search_top_k=4,
+                semantic_search_overfetch_k=20,
+                semantic_rerank=True,
+            )
+
+        assert result == Representation()
+        mock_query.assert_awaited_once()
+        assert mock_internal.await_args is not None
+        assert mock_internal.await_args.kwargs["precomputed_semantic_docs"] == []
+        assert mock_internal.await_args.kwargs["semantic_rerank"] is False
+
+    @pytest.mark.asyncio
     async def test_reranked_precompute_matches_in_session_semantic_filters(self):
         """The reranked candidate set must use the same filters as the
         non-rerank path, so a scoped rerank cannot widen recall."""

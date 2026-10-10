@@ -32,6 +32,14 @@ def _get_client() -> httpx.AsyncClient:
     return _client
 
 
+async def close_rerank_client() -> None:
+    """Close the shared client. Call from app shutdown on its owning loop."""
+    global _client, _client_loop
+    client, _client, _client_loop = _client, None, None
+    if client is not None and not client.is_closed:
+        await client.aclose()
+
+
 @dataclass(frozen=True)
 class RerankResult:
     index: int

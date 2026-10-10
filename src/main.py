@@ -166,8 +166,10 @@ async def lifespan(_: FastAPI):
         yield
     finally:
         # Import here to avoid circular import at module load time
+        from src.utils.rerank import close_rerank_client
         from src.vector_store import close_external_vector_store
 
+        await close_rerank_client()
         if reconciler_scheduler is not None:
             await reconciler_scheduler.shutdown()
         await deriver_metrics_poller.shutdown()

@@ -357,24 +357,31 @@ class RepresentationManager:
                 semantic_search_top_k=semantic_search_top_k,
                 include_most_derived=include_most_derived,
             )
-            precomputed_semantic_docs = list(
-                await crud.query_documents(
-                    None,
-                    workspace_name=self.workspace_name,
-                    observer=self.observer,
-                    observed=self.observed,
-                    query=include_semantic_query,
-                    max_distance=semantic_search_max_distance,
-                    top_k=semantic_observations,
-                    embedding=embedding,
-                    overfetch_k=semantic_search_overfetch_k,
-                    rerank=True,
-                    filters=self._build_filter_conditions(
-                        session_allowlist=session_allowlist
+            try:
+                precomputed_semantic_docs = list(
+                    await crud.query_documents(
+                        None,
+                        workspace_name=self.workspace_name,
+                        observer=self.observer,
+                        observed=self.observed,
+                        query=include_semantic_query,
+                        max_distance=semantic_search_max_distance,
+                        top_k=semantic_observations,
+                        embedding=embedding,
+                        overfetch_k=semantic_search_overfetch_k,
+                        rerank=True,
+                        filters=self._build_filter_conditions(
+                            session_allowlist=session_allowlist
+                        )
+                        or None,
                     )
-                    or None,
                 )
-            )
+            except Exception:
+                # Same best-effort contract as _query_documents_semantic: a
+                # failed semantic read degrades to recent/most-derived context.
+                # This read uses its own session, so the caller's is untouched.
+                logger.exception("Error getting reranked relevant observations")
+                precomputed_semantic_docs = []
         effective_semantic_rerank = (
             False if precomputed_semantic_docs is not None else semantic_rerank
         )

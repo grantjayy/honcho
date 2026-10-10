@@ -139,6 +139,21 @@ async def test_rerank_texts_reuses_one_client(
 
 
 @pytest.mark.asyncio
+async def test_close_rerank_client_closes_and_clears_shared_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
+    factory = _install(monkeypatch, _ranking)
+
+    assert await rerank_texts(query="q", documents=["a", "b", "c"], top_k=2)
+    await rerank.close_rerank_client()
+
+    assert factory.created[0].is_closed
+    assert rerank._client is None  # pyright: ignore[reportPrivateUsage]
+    await rerank.close_rerank_client()  # idempotent
+
+
+@pytest.mark.asyncio
 async def test_rerank_texts_replaces_a_closed_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
