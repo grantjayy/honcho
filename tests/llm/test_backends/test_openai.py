@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, Mock
 import httpx
 import pytest
 from openai import BadRequestError
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from src.exceptions import ValidationException
 from src.llm.backends.openai import (
@@ -898,9 +898,10 @@ async def test_structured_output_json_object_mode_request_shape() -> None:
 
 
 @pytest.mark.asyncio
-async def test_structured_output_json_object_mode_repairs_markdown() -> None:
-    """A provider that ignores json_object and returns prose must not crash —
-    PromptRepresentation repairs to an empty representation, not an exception."""
+async def test_structured_output_json_object_mode_prose_raises() -> None:
+    """A provider that ignores json_object and returns prose raises a
+    ValidationError instead of an empty representation, so honcho_llm_call
+    retries and can reach the fallback model."""
     client = Mock()
     client.chat.completions.parse = AsyncMock()
     client.chat.completions.create = AsyncMock(
@@ -910,15 +911,14 @@ async def test_structured_output_json_object_mode_repairs_markdown() -> None:
     )
 
     backend = OpenAIBackend(client)
-    result = await backend.complete(
-        model="glm-4.6",
-        messages=[{"role": "user", "content": "Hello"}],
-        max_tokens=100,
-        response_format=PromptRepresentation,
-        extra_params={"structured_output_mode": "json_object"},
-    )
-
-    assert isinstance(result.content, PromptRepresentation)
+    with pytest.raises(ValidationError):
+        await backend.complete(
+            model="glm-4.6",
+            messages=[{"role": "user", "content": "Hello"}],
+            max_tokens=100,
+            response_format=PromptRepresentation,
+            extra_params={"structured_output_mode": "json_object"},
+        )
 
 
 @pytest.mark.asyncio

@@ -33,7 +33,12 @@ def repair_response_model_json(
     response_model: type[BaseModel],
     _model: str,
 ) -> BaseModel:
-    """Repair truncated or malformed JSON and validate against the response model."""
+    """Repair truncated or malformed JSON and validate against the response model.
+
+    Empty content becomes an empty ``PromptRepresentation``. Non-empty content
+    that cannot be repaired into the response model raises, so
+    ``honcho_llm_call`` retries and its final attempt can use the fallback model.
+    """
 
     try:
         final = validate_and_repair_json(raw_content)
@@ -65,7 +70,7 @@ def repair_response_model_json(
     try:
         return response_model.model_validate_json(final)
     except ValidationError:
-        if response_model is PromptRepresentation:
+        if response_model is PromptRepresentation and not raw_content.strip():
             return PromptRepresentation(explicit=[])
         raise
 

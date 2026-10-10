@@ -214,9 +214,10 @@ class OpenAIBackend:
                 response = await self._client.chat.completions.parse(**params)
             except LengthFinishReasonError as exc:
                 # Truncated output: repair the partial content directly. repair
-                # handles empty/unrepairable JSON with its own model-aware fallback
-                # (PromptRepresentation -> empty, others -> raise), which differs
-                # from the parse-fallback terminal below, so it stays a direct call.
+                # has its own model-aware fallback (empty content ->
+                # PromptRepresentation empty, unrepairable text -> raise), which
+                # differs from the parse-fallback terminal below, so it stays a
+                # direct call.
                 truncated = exc.completion
                 raw_content = truncated.choices[0].message.content or ""
                 content = repair_response_model_json(

@@ -176,15 +176,18 @@ class TestOpenAILengthFinishReasonRepair:
         assert len(response.content.explicit) >= 1
         assert response.finish_reasons == ["length"]
 
-    async def test_completely_broken_json_falls_back_to_empty(self) -> None:
-        """Completely unrepairable JSON should fall back to empty PromptRepresentation."""
+    async def test_completely_broken_json_raises(self) -> None:
+        """Unrepairable non-empty text raises so honcho_llm_call can retry it."""
         mock_client = AsyncMock(spec=AsyncOpenAI)
         mock_client.chat.completions.parse = _raise_length_error(
             "this is not json at all just random text"
         )
 
-        with patch.dict(CLIENTS, {"openai": mock_client}):
-            response = await honcho_llm_call_inner(
+        with (
+            patch.dict(CLIENTS, {"openai": mock_client}),
+            pytest.raises(ValidationError),
+        ):
+            await honcho_llm_call_inner(
                 provider="openai",
                 model="test-model",
                 prompt="Analyze messages",
@@ -192,10 +195,6 @@ class TestOpenAILengthFinishReasonRepair:
                 response_model=PromptRepresentation,
                 json_mode=True,
             )
-
-        assert isinstance(response.content, PromptRepresentation)
-        assert response.content.explicit == []
-        assert response.finish_reasons == ["length"]
 
     async def test_empty_content_falls_back_to_empty(self) -> None:
         """Empty/null content should fall back to empty PromptRepresentation."""
@@ -307,14 +306,17 @@ class TestAnthropicJsonRepair:
         assert isinstance(response.content, PromptRepresentation)
         assert len(response.content.explicit) >= 1
 
-    async def test_broken_anthropic_response_falls_back_to_empty(self) -> None:
-        """Completely broken Anthropic JSON should fall back to empty PromptRepresentation."""
+    async def test_broken_anthropic_response_raises(self) -> None:
+        """Unrepairable non-empty Anthropic text raises so it can be retried."""
         mock_client = _make_anthropic_mock(
             "random gibberish that is not json", stop_reason="max_tokens"
         )
 
-        with patch.dict(CLIENTS, {"anthropic": mock_client}):
-            response = await honcho_llm_call_inner(
+        with (
+            patch.dict(CLIENTS, {"anthropic": mock_client}),
+            pytest.raises(ValidationError),
+        ):
+            await honcho_llm_call_inner(
                 provider="anthropic",
                 model="claude-3-sonnet",
                 prompt="Analyze messages",
@@ -322,9 +324,6 @@ class TestAnthropicJsonRepair:
                 response_model=PromptRepresentation,
                 json_mode=True,
             )
-
-        assert isinstance(response.content, PromptRepresentation)
-        assert response.content.explicit == []
 
     async def test_non_prompt_representation_reraises(self) -> None:
         """Non-PromptRepresentation with broken JSON should raise."""
@@ -380,8 +379,8 @@ class TestGeminiJsonRepair:
         assert isinstance(response.content, PromptRepresentation)
         assert len(response.content.explicit) == 2
 
-    async def test_gemini_broken_text_falls_back_to_empty(self) -> None:
-        """Gemini with broken text and no parsed content should fall back."""
+    async def test_gemini_broken_text_raises(self) -> None:
+        """Gemini broken text with no parsed content raises so it can be retried."""
         from google import genai
 
         mock_client = _make_gemini_mock(
@@ -389,8 +388,11 @@ class TestGeminiJsonRepair:
         )
         mock_client.__class__ = genai.Client  # pyright: ignore[reportAttributeAccessIssue]
 
-        with patch.dict(CLIENTS, {"gemini": mock_client}):
-            response = await honcho_llm_call_inner(
+        with (
+            patch.dict(CLIENTS, {"gemini": mock_client}),
+            pytest.raises(ValidationError),
+        ):
+            await honcho_llm_call_inner(
                 provider="gemini",
                 model="gemini-2.5-flash",
                 prompt="Analyze messages",
@@ -398,9 +400,6 @@ class TestGeminiJsonRepair:
                 response_model=PromptRepresentation,
                 json_mode=True,
             )
-
-        assert isinstance(response.content, PromptRepresentation)
-        assert response.content.explicit == []
 
 
 # ---------------------------------------------------------------------------

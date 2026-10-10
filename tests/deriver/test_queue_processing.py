@@ -1,11 +1,15 @@
 import asyncio
+import json
+import logging
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
+import httpx
 import pytest
 from nanoid import generate as generate_nanoid
+from openai import AsyncOpenAI
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
@@ -2188,6 +2192,92 @@ class TestQueueRetry:
         assert items[0].error is not None
         assert "ValueError" in items[0].error
         assert await self._retry_attempts_on_items(db_session, work_unit_key) is None
+
+    async def test_unparseable_deriver_output_marks_item_errored(
+        self,
+        db_session: AsyncSession,
+        sample_session_with_peers: tuple[models.Session, list[models.Peer]],
+        create_queue_payload: Callable[..., Any],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Unparseable model output on every attempt errors the queue item.
+
+        The real deriver and retry chain run against the real OpenAI SDK; only
+        the HTTP transport is replaced. The batch must not be recorded as a
+        success with zero observations.
+        """
+        from tenacity import wait_none
+
+        from src.config import ConfiguredModelSettings, FallbackModelSettings
+        from src.llm import CLIENTS, api
+
+        monkeypatch.setattr(api, "wait_exponential", Mock(return_value=wait_none()))
+        monkeypatch.setattr(
+            settings.DERIVER,
+            "MODEL_CONFIG",
+            ConfiguredModelSettings(
+                model="primary-model",
+                transport="openai",
+                fallback=FallbackModelSettings(
+                    model="fallback-model", transport="openai"
+                ),
+            ),
+        )
+        requested_models: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requested_models.append(json.loads(request.content)["model"])
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "test",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "I could not find any durable facts in",
+                            },
+                            "finish_reason": "length",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 5,
+                        "total_tokens": 15,
+                    },
+                },
+            )
+
+        client = AsyncOpenAI(
+            api_key="test-key",
+            base_url="https://llm.invalid/v1",
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+        qm, work_unit_key, worker_id, _ = await self._seed_work_unit(
+            db_session, sample_session_with_peers, create_queue_payload
+        )
+
+        try:
+            with (
+                patch.dict(CLIENTS, {"openai": client}),
+                caplog.at_level(logging.WARNING, logger="src.deriver.deriver"),
+            ):
+                await qm.process_work_unit(work_unit_key, worker_id)
+        finally:
+            await client.close()
+
+        assert requested_models == ["primary-model", "primary-model", "fallback-model"]
+        items = await self._fetch_items(db_session, work_unit_key)
+        assert len(items) == 1
+        assert items[0].processed
+        assert items[0].error is not None
+        assert "ValidationError" in items[0].error
+        assert "zero observations" not in caplog.text
 
     async def test_counter_cleared_after_success(
         self,
