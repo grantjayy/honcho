@@ -26,8 +26,11 @@ connect_args = {
     # the server/pooler is unreachable or stalled (psycopg, seconds).
     "connect_timeout": settings.DB.CONNECT_TIMEOUT_SECONDS,
     # One global HNSW index stops at ef_search (40) candidates before the observer
-    # filter, which returned 17-38 of 75 requested rows; strict_order returned 75.
-    "options": "-c hnsw.iterative_scan=strict_order",
+    # filter, which returned 17-38 of 75 requested rows. Iterative scan fills the
+    # request. relaxed_order: on a 1.1M-row copy, session-scoped 75-row queries ran
+    # p95 0.25 s versus 16 s for strict_order, with the same rows returned. Results
+    # can be slightly out of distance order; the reranker reorders them anyway.
+    "options": "-c hnsw.iterative_scan=relaxed_order",
 }
 
 # Context variable to store request context

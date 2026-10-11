@@ -36,14 +36,14 @@ def _vector(*components: tuple[int, float]) -> list[float]:
 
 
 @pytest.mark.asyncio
-async def test_app_sessions_use_strict_order_iterative_scan() -> None:
+async def test_app_sessions_use_relaxed_order_iterative_scan() -> None:
     try:
         for session_factory in (SessionLocal, ReadSessionLocal):
             async with session_factory() as session:
                 value = (
                     await session.execute(text("SHOW hnsw.iterative_scan"))
                 ).scalar()
-            assert value == "strict_order"
+            assert value == "relaxed_order"
     finally:
         await engine.dispose()
 
