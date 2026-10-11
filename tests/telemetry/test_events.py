@@ -32,6 +32,7 @@ from src.telemetry.events.dialectic import DialecticCompletedEvent
 from src.telemetry.events.dream import DreamRunEvent, DreamSpecialistEvent
 from src.telemetry.events.llm import CallPurpose, LLMCallCompletedEvent
 from src.telemetry.events.reconciliation import (
+    BackfillCompletedEvent,
     CleanupStaleItemsCompletedEvent,
     SyncVectorsCompletedEvent,
 )
@@ -239,6 +240,7 @@ class TestLLMCallCompletedEvent:
         assert CallPurpose.DIALECTIC_ANSWER.value == "dialectic.answer"
         assert CallPurpose.DREAM_DEDUCTION.value == "dream.deduction"
         assert CallPurpose.DREAM_INDUCTION.value == "dream.induction"
+        assert CallPurpose.DREAM_CARD_REFRESH.value == "dream.card_refresh"
         assert CallPurpose.SUMMARY_SHORT.value == "summary.short"
         assert CallPurpose.SUMMARY_LONG.value == "summary.long"
 
@@ -884,6 +886,33 @@ class TestSyncVectorsCompletedEvent:
         assert event.documents_failed == 0
         assert event.message_embeddings_synced == 0
         assert event.message_embeddings_failed == 0
+
+
+# =============================================================================
+# Tests for BackfillCompletedEvent
+# =============================================================================
+
+
+class TestBackfillCompletedEvent:
+    """Tests for BackfillCompletedEvent."""
+
+    def test_event_type(self):
+        """event_type() returns correct value."""
+        assert (
+            BackfillCompletedEvent.event_type() == "reconciliation.backfill.completed"
+        )
+
+    def test_get_resource_id(self, fixed_timestamp: datetime):
+        """get_resource_id() is keyed by backfill name."""
+        event = BackfillCompletedEvent(
+            timestamp=fixed_timestamp,
+            backfill_name="document_sources",
+            rows_touched=10,
+            batches=2,
+            still_pending=False,
+            total_duration_ms=5.0,
+        )
+        assert event.get_resource_id() == "backfill:document_sources"
 
 
 # =============================================================================

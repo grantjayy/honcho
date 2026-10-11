@@ -12,13 +12,15 @@ no-op if the same flag was already set at an outer level.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Optional
 
 import typer
 
 from honcho import Honcho
 
-from honcho_cli.config import CLIConfig, get_client_kwargs
+from honcho_cli import oauth
+from honcho_cli.config import CLIConfig, OAuthTokens, get_client_kwargs
 from honcho_cli.output import print_error, set_json_mode
 from honcho_cli.validation import validate_resource_id
 
@@ -50,6 +52,59 @@ def get_resolved_config():
     return config
 
 
+def get_flag_overrides() -> dict[str, str | None]:
+    """Workspace/peer/session as supplied by ``-w``/``-p``/``-s`` at any level.
+
+    Unlike :func:`get_resolved_config`, this excludes values coming from the
+    environment or config file.
+    """
+    return dict(_global_overrides)
+
+
+def maybe_refresh_token(config: CLIConfig) -> None:
+    """Refresh an expired OAuth access token in place and persist it.
+
+    No-op when there is no grant for the current host or the token is still
+    valid. A dead grant degrades to the saved apiKey with a warning; exits
+    only when nothing is left to authenticate with.
+    """
+    tokens = config.usable_oauth()
+    if tokens is None or tokens.access_valid():
+        return
+
+    if tokens.refresh_token:
+        endpoints = oauth.resolve_endpoints(config.base_url)
+        if tokens.client_id:
+            endpoints = replace(endpoints, client_id=tokens.client_id)
+        try:
+            refreshed = oauth.refresh_access_token(endpoints, tokens.refresh_token)
+        except oauth.OAuthFlowError:
+            refreshed = None
+        if refreshed is not None:
+            # rotation-safe: persist the (possibly new) refresh token before
+            # it's reused; keep the old one if the server didn't rotate
+            # (refresh_token is optional)
+            config.oauth = OAuthTokens.from_response(
+                refreshed,
+                client_id=tokens.client_id,
+                scope_fallback=tokens.scope,
+                refresh_fallback=tokens.refresh_token,
+                host=tokens.host,
+            )
+            config.save()
+            return
+
+    if config.api_key:
+        typer.echo(
+            "OAuth session expired; using the saved API key. "
+            "Run `honcho init` to log in again.",
+            err=True,
+        )
+        return
+    print_error("SESSION_EXPIRED", "OAuth session expired. Run `honcho init` to log in again.")
+    raise typer.Exit(1)
+
+
 def get_client(*, require_workspace: bool = True):
     """Create a Honcho client from resolved config.
 
@@ -65,6 +120,7 @@ def get_client(*, require_workspace: bool = True):
             "No workspace scoped. Pass --workspace/-w or set HONCHO_WORKSPACE_ID.",
         )
         raise typer.Exit(1)
+    maybe_refresh_token(config)
     return Honcho(**get_client_kwargs(config)), config
 
 
@@ -110,3 +166,44 @@ def add_common_options(app: typer.Typer) -> None:
 
         if ctx.invoked_subcommand is None:
             typer.echo(ctx.get_help())
+
+
+def format_evidence(evidence) -> dict:
+    """Shape a dialectic `Evidence` for output.
+
+    Evidence is collated from what the agent accessed rather than reported by
+    the model, so it over-reports: a conclusion is listed because the agent
+    read it, which is not proof the answer leaned on it. Messages carry
+    identity only -- no content -- so they are summarised per session rather
+    than listed one by one.
+    """
+    if evidence is None:
+        return {"conclusions": [], "messages": {"total": 0, "sessions": []}, "tool_calls": []}
+
+    sessions: dict[str, int] = {}
+    for m in evidence.messages:
+        sessions[m.session_id] = sessions.get(m.session_id, 0) + 1
+
+    return {
+        "conclusions": [
+            {
+                "id": c.id,
+                "level": c.level,
+                "content": c.content,
+                "source_ids": list(c.source_ids or []),
+                "session_id": c.session_id,
+                "created_at": str(c.created_at),
+            }
+            for c in evidence.conclusions
+        ],
+        "messages": {
+            "total": len(evidence.messages),
+            "sessions": [
+                {"session_id": sid, "count": n}
+                for sid, n in sorted(sessions.items(), key=lambda kv: -kv[1])
+            ],
+        },
+        "tool_calls": [
+            {"tool_name": t.tool_name, "tool_input": t.tool_input} for t in evidence.tool_calls
+        ],
+    }
