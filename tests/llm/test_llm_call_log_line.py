@@ -11,6 +11,7 @@ import time
 
 import pytest
 
+from src.config import ModelConfig
 from src.llm.backend import CompletionResult as BackendCompletionResult
 from src.llm.executor import _emit_call_telemetry  # pyright: ignore[reportPrivateUsage]
 from src.llm.runtime import AttemptPlan
@@ -18,13 +19,19 @@ from src.llm.types import LLMTelemetryContext
 
 
 def _plan(*, is_fallback: bool = False, attempt: int = 1) -> AttemptPlan:
+    # Production callers pass no per-call effort, so the plan carries None and
+    # the configured effort lives on selected_config. The log must report it.
     return AttemptPlan(
         provider="openai",
         model="meta/muse-spark-1.2-contributor",
         client=object(),  # pyright: ignore[reportArgumentType]
         thinking_budget_tokens=None,
-        reasoning_effort="medium",
-        selected_config=object(),  # pyright: ignore[reportArgumentType]
+        reasoning_effort=None,
+        selected_config=ModelConfig(
+            model="meta/muse-spark-1.2-contributor",
+            transport="openai",
+            thinking_effort="medium",
+        ),
         attempt=attempt,
         retry_attempts=3,
         is_fallback=is_fallback,

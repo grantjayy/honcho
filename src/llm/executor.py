@@ -194,7 +194,15 @@ def _emit_call_telemetry(
         + "cache_read_tokens=%d output_tokens=%d",
         telemetry.call_purpose if telemetry is not None else None,
         model,
-        plan.reasoning_effort if plan is not None else None,
+        # The plan holds only a per-call override; the configured effort
+        # lives on the selected config. getattr matches infer_provider_label:
+        # selected_config can be a stub, and logging must never raise here.
+        (
+            plan.reasoning_effort
+            or getattr(plan.selected_config, "thinking_effort", None)
+        )
+        if plan is not None
+        else None,
         plan.attempt if plan is not None else 1,
         plan.retry_attempts if plan is not None else 1,
         "true" if plan is not None and plan.is_fallback else "false",
