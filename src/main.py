@@ -53,6 +53,7 @@ from src.telemetry.client_context import (
     reset_client_context,
     set_client_context,
 )
+from src.telemetry.log_files import configure_log_file
 from src.telemetry.logging import get_route_template
 from src.telemetry.sentry import initialize_sentry
 
@@ -83,6 +84,7 @@ logging.basicConfig(
     level=get_log_level(),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
+configure_log_file("api", log_dir=settings.LOG_DIR)
 logger = logging.getLogger(__name__)
 
 # Suppress cashews Redis error logs (NoScriptError, ConnectionError, etc.)

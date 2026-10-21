@@ -185,6 +185,26 @@ def _emit_call_telemetry(
     """
     duration_ms = (time.perf_counter() - started_at) * 1000
     outcome = _outcome_from_error(error)
+    # One line per provider attempt is the operator's cost receipt. It names
+    # the model that actually ran (primary or fallback), so token volume can
+    # be priced from the log files alone.
+    logger.info(
+        "LLM_CALL purpose=%s model=%s effort=%s attempt=%d/%d fallback=%s "
+        + "outcome=%s error=%s duration_ms=%.0f input_tokens=%d "
+        + "cache_read_tokens=%d output_tokens=%d",
+        telemetry.call_purpose if telemetry is not None else None,
+        model,
+        plan.reasoning_effort if plan is not None else None,
+        plan.attempt if plan is not None else 1,
+        plan.retry_attempts if plan is not None else 1,
+        "true" if plan is not None and plan.is_fallback else "false",
+        outcome,
+        type(error).__name__ if error is not None else None,
+        duration_ms,
+        result.input_tokens if result is not None else 0,
+        result.cache_read_input_tokens if result is not None else 0,
+        result.output_tokens if result is not None else 0,
+    )
     _emit_llm_call_completed(
         plan=plan,
         telemetry=telemetry,

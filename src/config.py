@@ -1589,6 +1589,8 @@ class AppSettings(HonchoSettings):
 
     # Application-wide settings
     LOG_LEVEL: str = "INFO"
+    # Directory for rotating per-service log files. Unset keeps stdout only.
+    LOG_DIR: str | None = None
     PERFORMANCE_LOG_FORMAT: str = "compact"
     SESSION_OBSERVERS_LIMIT: Annotated[int, Field(default=10, gt=0)] = 10
     MAX_FILE_SIZE: Annotated[int, Field(default=5_242_880, gt=0)] = 5_242_880  # 5MB

@@ -200,3 +200,6 @@ grafana-data/
 # Sandbox real-provider credentials (see sandbox/real.env.example)
 sandbox/real.env
 sandbox/.state.env
+
+# Host-mounted Honcho service logs (LOG_DIR)
+/logs/

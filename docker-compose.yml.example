@@ -39,6 +39,8 @@ services:
     volumes:
       # Shared LanceDB data (used when VECTOR_STORE_TYPE=lancedb)
       - lancedb-data:/app/lancedb_data
+      # Host folder for rotating api.log / deriver.log (LOG_DIR)
+      - ./logs:/app/logs
       # -- Development: mount source for live reload --
       # - .:/app
       # - venv:/app/.venv
@@ -46,6 +48,7 @@ services:
       - DB_CONNECTION_URI=postgresql+psycopg://postgres:postgres@database:5432/postgres
       - CACHE_URL=redis://redis:6379/0?suppress=true
       - CACHE_ENABLED=true
+      - LOG_DIR=/app/logs
     env_file:
       - path: .env
         required: false
@@ -68,6 +71,8 @@ services:
     volumes:
       # Shared LanceDB data (used when VECTOR_STORE_TYPE=lancedb)
       - lancedb-data:/app/lancedb_data
+      # Host folder for rotating api.log / deriver.log (LOG_DIR)
+      - ./logs:/app/logs
       # -- Development: mount source for live reload --
       # - .:/app
       # - venv:/app/.venv
@@ -75,6 +80,7 @@ services:
       - DB_CONNECTION_URI=postgresql+psycopg://postgres:postgres@database:5432/postgres
       - CACHE_URL=redis://redis:6379/0?suppress=true
       - CACHE_ENABLED=true
+      - LOG_DIR=/app/logs
     env_file:
       - path: .env
         required: false

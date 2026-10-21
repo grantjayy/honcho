@@ -18,6 +18,7 @@ from src.telemetry import (
     register_db_pool_collector,
     shutdown_telemetry,
 )
+from src.telemetry.log_files import configure_log_file
 
 from .queue_manager import main
 
@@ -63,6 +64,7 @@ def setup_logging():
         level=log_level,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
+    configure_log_file("deriver", log_dir=settings.LOG_DIR)
 
     # Disable SQLAlchemy engine logging unless explicitly enabled
     if not settings.DB.SQL_DEBUG:
