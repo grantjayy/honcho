@@ -6,6 +6,7 @@ import type {
   Summary,
   SessionSummaries,
 } from "@honcho-ai/sdk";
+import { HonchoError } from "@honcho-ai/sdk";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { HonchoConfig } from "./config.js";
 
@@ -15,6 +16,12 @@ export interface ToolContext {
   clientFor: (workspaceId?: string) => Honcho;
   /** Client used only for credential-scoped ops (list workspaces). */
   unscoped: Honcho;
+  /**
+   * Called when the Honcho API rejects this connection's OAuth access token.
+   * The HTTP entry points answer the request with 401 instead of a tool
+   * error, which is what makes an MCP client refresh its token.
+   */
+  onUnauthorized?: () => void;
 }
 
 /**
@@ -41,6 +48,78 @@ export function errorResult(msg: string): CallToolResult {
   return { content: [{ type: "text", text: msg }], isError: true };
 }
 
+/** Hosted Honcho OAuth access tokens carry this prefix; API keys do not. */
+export const OAUTH_ACCESS_TOKEN_PREFIX = "hch-at-";
+
+/**
+ * The hosted gateway's 401 detail for an expired or revoked access token.
+ * Honcho itself also answers 401 when a live token may not use a route, and
+ * refreshing would not fix that, so the detail is what tells them apart.
+ */
+const GATEWAY_TOKEN_REJECTED_DETAIL = "Invalid or expired access token";
+
+export const TOKEN_REJECTED_MESSAGE =
+  "Honcho rejected the access token (expired or revoked). Re-authenticate this MCP server.";
+
+/**
+ * True when the Honcho API refused the call because the OAuth access token
+ * behind this connection is no longer valid. API keys are left alone: a 401
+ * on a key is a bad key, or a scoped key on an admin route, and the client
+ * holding it has nothing to refresh.
+ */
+export function isTokenRejected(e: unknown, apiKey: string): boolean {
+  return (
+    e instanceof HonchoError &&
+    e.status === 401 &&
+    e.message === GATEWAY_TOKEN_REJECTED_DETAIL &&
+    apiKey.startsWith(OAUTH_ACCESS_TOKEN_PREFIX)
+  );
+}
+
+/**
+ * Tool error for a failed Honcho call. A rejected OAuth token is reported in
+ * plain words and flagged on the context, so the HTTP layer can turn the
+ * response into a 401 (see `invalidTokenResponse`).
+ */
+export function failedResult(
+  ctx: ToolContext,
+  prefix: string,
+  e: unknown,
+): CallToolResult {
+  if (isTokenRejected(e, ctx.config.apiKey)) {
+    ctx.onUnauthorized?.();
+    return errorResult(`${prefix}: ${TOKEN_REJECTED_MESSAGE}`);
+  }
+  return errorResult(
+    `${prefix}: ${e instanceof Error ? e.message : String(e)}`,
+  );
+}
+
+/**
+ * HTTP 401 for a rejected access token (RFC 6750 §3, RFC 9728 §5.1). The
+ * `invalid_token` error is what tells an MCP client to use its refresh token
+ * rather than start a new sign-in; `resource_metadata` keeps discovery intact.
+ */
+export function invalidTokenResponse(
+  resourceMetadataUrl: string,
+  headers: Record<string, string>,
+): Response {
+  return new Response(
+    JSON.stringify({
+      error: "invalid_token",
+      error_description: TOKEN_REJECTED_MESSAGE,
+    }),
+    {
+      status: 401,
+      headers: {
+        "Content-Type": "application/json",
+        "WWW-Authenticate": `Bearer error="invalid_token", error_description="The access token is expired or revoked", resource_metadata="${resourceMetadataUrl}"`,
+        ...headers,
+      },
+    },
+  );
+}
+
 /** Serialize a Message to a plain JSON-safe object. */
 export function formatMessage(message: Message) {
   return {
@@ -57,16 +136,22 @@ export function formatMessage(message: Message) {
  * Serialize a Conclusion to a plain JSON-safe object.
  *
  * `level`, `source_ids` and `times_derived` are the attribution fields the
- * server started returning in Honcho v3.2.0. `source_ids` is null for
+ * server started returning in Honcho v3.2.0. `source_ids` is empty for
  * explicit conclusions, which are extracted from messages rather than
- * derived from other conclusions.
+ * derived from other conclusions. `source_message_ids` (v3.5.0) is the
+ * reverse: the messages an explicit conclusion cites, null for derived ones.
+ * Read structurally so this compiles against SDKs that predate the field.
  */
 export function formatConclusion(conclusion: Conclusion) {
+  const { sourceMessageIds = null } = conclusion as Conclusion & {
+    sourceMessageIds?: string[] | null;
+  };
   return {
     id: conclusion.id,
     content: conclusion.content,
     level: conclusion.level,
     source_ids: conclusion.sourceIds,
+    source_message_ids: sourceMessageIds,
     times_derived: conclusion.timesDerived,
     observer_id: conclusion.observerId,
     observed_id: conclusion.observedId,

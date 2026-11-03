@@ -11,3 +11,10 @@ dependencies = [
     "honcho-ai>=2.2.0,<3",
     "httpx>=0.27,<1",
 ]
+
+# No dependency groups or extras here: Hermes locks this file as a member of a uv workspace whose
+# root project is hermes-agent, and uv parses every member's groups while locking, so a test pin on
+# hermes-agent fails every install and update (#1485). The test environment is tests/pyproject.toml.
+
+[tool.uv]
+package = false

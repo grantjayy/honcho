@@ -28,15 +28,18 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import exists, or_, select, update
+from nanoid import generate as generate_nanoid
+from sqlalchemy import delete, exists, insert, or_, select, update
 from sqlalchemy.dialects.postgresql import array
 from sqlalchemy.orm import load_only
 from sqlalchemy.sql.functions import func
 
 from src import crud, models
 from src.config import settings
+from src.crud.document import build_source_message_links
 from src.crud.scope import ScopeBackfillState
 from src.dependencies import tracked_db
+from src.dreamer.working_memory import EPOCH_KEY, NOTES_KEY
 from src.embedding_client import embedding_client
 from src.schemas import DreamType
 from src.utils.queue_payload import ScopeBackfillPayload, ScopeRemovalPayload
@@ -88,6 +91,7 @@ class _CopySpec:
     internal_metadata: dict[str, Any]
     times_derived: int
     source_ids: list[str] | None
+    source_message_ids: list[str] | None
     session_name: str
     restore_document_id: str | None = None
 
@@ -261,6 +265,7 @@ async def _run_backfill(
                     source_ids=list(source.source_ids)
                     if source.source_ids is not None
                     else None,
+                    source_message_ids=source.source_message_ids,
                     session_name=session_name,
                     restore_document_id=soft_deleted_copies.get(key),
                 )
@@ -358,9 +363,21 @@ async def _copy_chunk(
             )
 
         restore_ids: list[str] = []
+        restored_citations: list[dict[str, Any]] = []
         for spec in plans:
             if spec.restore_document_id is not None:
                 restore_ids.append(spec.restore_document_id)
+                restored_citations.extend(
+                    {
+                        "conclusion_id": spec.restore_document_id,
+                        "message_id": link.message_id,
+                        "position": link.position,
+                        "workspace_name": workspace_name,
+                    }
+                    for link in build_source_message_links(
+                        spec.source_message_ids, workspace_name
+                    )
+                )
                 continue
             row = models.Document(
                 workspace_name=workspace_name,
@@ -375,6 +392,7 @@ async def _copy_chunk(
                 },
                 session_name=spec.session_name,
                 source_ids=spec.source_ids,
+                source_message_ids=spec.source_message_ids,
                 embedding=spec.embedding if store_in_postgres else None,
             )
             row.sync_state = "pending"
@@ -387,6 +405,17 @@ async def _copy_chunk(
                 .where(models.Document.id.in_(restore_ids))
                 .values(deleted_at=None, sync_state="pending")
             )
+            # The source may have gained citations since this copy was
+            # removed; a restored copy takes the source's current set.
+            await db.execute(
+                delete(models.ConclusionSourceMessage).where(
+                    models.ConclusionSourceMessage.conclusion_id.in_(restore_ids)
+                )
+            )
+            if restored_citations:
+                await db.execute(
+                    insert(models.ConclusionSourceMessage), restored_citations
+                )
         await db.commit()
 
         # IDs are generated client-side and remain accessible post-commit
@@ -496,19 +525,43 @@ async def process_scope_removal(
     Soft-deletes (fail-closed) rather than hard-deletes: the reconciler's
     soft-delete sweep handles vector cleanup and eventual hard deletion, and a
     later re-add restores the same rows.
+
+    Skipped entirely if the session is an active member again: it was re-added
+    after this task was queued, and its copies, notes and status are live data
+    the re-add's backfill reconciles.
     """
     scope_peer = payload.scope_peer
     session_name = payload.session_name
 
     removed_by_observed: dict[str, list[str]] = {}
     async with tracked_db("scope_removal") as db:
+        # Row-lock the membership for this whole transaction, as the backfill's
+        # write phase does, so a re-add can't commit between this check and the
+        # writes below. Nothing here commits until the end, so the lock holds.
+        rejoined = await db.scalar(
+            select(models.SessionPeer.left_at.is_(None))
+            .where(models.SessionPeer.workspace_name == workspace_name)
+            .where(models.SessionPeer.session_name == session_name)
+            .where(models.SessionPeer.peer_name == scope_peer)
+            .with_for_update()
+        )
+        if rejoined:
+            logger.info(
+                "Scope removal skipped for %s/%s/%s: the session is a member again",
+                workspace_name,
+                scope_peer,
+                session_name,
+            )
+            return
+
         observed_result = await db.execute(
             select(models.Collection.observed).where(
                 models.Collection.workspace_name == workspace_name,
                 models.Collection.observer == scope_peer,
             )
         )
-        for observed in [row[0] for row in observed_result.all()]:
+        observed_in_scope = [row[0] for row in observed_result.all()]
+        for observed in observed_in_scope:
             explicit_stmt = (
                 update(models.Document)
                 .where(
@@ -557,6 +610,24 @@ async def process_scope_removal(
             if all_removed:
                 removed_by_observed[observed] = all_removed
 
+        # Dream notes are free text, possibly written from the removed
+        # session's messages even where it left no conclusions, so they go for
+        # every collection in the scope, in the same commit as the conclusions.
+        # Unlike the card they can't be rebuilt from what remains. A new epoch
+        # turns away note writes from dreams that started before this, which
+        # may still hold the old notes. The cursor stays.
+        epoch = str(generate_nanoid())
+        for observed in observed_in_scope:
+            await crud.merge_collection_internal_metadata_value(
+                db,
+                workspace_name,
+                scope_peer,
+                observed,
+                NOTES_KEY,
+                {"entries": [], EPOCH_KEY: epoch},
+                commit=False,
+            )
+
         # The session left the scope, so its backfill status entry is moot;
         # clearing it keeps a later re-add starting from a fresh "pending".
         await crud.clear_scope_backfill_status(
@@ -564,6 +635,8 @@ async def process_scope_removal(
         )
         await db.commit()
     await crud.invalidate_scope_peer_cache(workspace_name, scope_peer)
+    for observed in observed_in_scope:
+        await crud.invalidate_collection_cache(workspace_name, scope_peer, observed)
 
     # Delete the vectors eagerly so recall can't surface removed memory while
     # waiting for the reconciler sweep (which remains the backstop on failure).

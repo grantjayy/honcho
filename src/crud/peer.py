@@ -19,6 +19,7 @@ from src.cache.client import (
     safe_cache_delete,
 )
 from src.config import settings
+from src.crud.lifecycle import live_peer_row, live_session_peer_row, live_session_row
 from src.crud.workspace import get_or_create_workspace
 from src.exceptions import (
     ConflictException,
@@ -27,8 +28,10 @@ from src.exceptions import (
 )
 from src.models import Peer
 from src.schemas.api import RESOURCE_NAME_PATTERN
+from src.telemetry.events import PeerCreatedEvent, emit
 from src.utils import scopes as scopes_util
 from src.utils.filter import apply_filter
+from src.utils.path_params import schema_from_path
 from src.utils.types import GetOrCreateResult
 
 logger = getLogger(__name__)
@@ -282,7 +285,9 @@ async def get_or_create_peers(
             reserved-prefix or non-conforming name on the create path
     """
 
-    await get_or_create_workspace(db, schemas.WorkspaceCreate(name=workspace_name))
+    ws_result = await get_or_create_workspace(
+        db, schema_from_path(schemas.WorkspaceCreate, "workspace_id", workspace_name)
+    )
     peer_names = [p.name for p in peers]
     # Before the lookup: these values cannot match a stored row and would fail
     # inside the query itself rather than as a clean 422.
@@ -291,6 +296,7 @@ async def get_or_create_peers(
         select(models.Peer)
         .where(models.Peer.workspace_name == workspace_name)
         .where(models.Peer.name.in_(peer_names))
+        .where(live_peer_row())
     )
     result = await db.execute(stmt)
     existing_peers: list[Peer] = list(result.scalars().all())
@@ -380,16 +386,21 @@ async def get_or_create_peers(
         )
     ]
 
-    async def _invalidate_peer_cache():
+    new_peer_names = [p.name for p in new_peers]
+
+    async def _after_commit():
+        await ws_result.post_commit()
         for cache_key in _cache_keys_to_invalidate:
             await safe_cache_delete(cache_key)
+        for name in new_peer_names:
+            emit(PeerCreatedEvent(workspace_name=workspace_name, peer_name=name))
 
     # Return combined list of existing and new peers
     # created=True if any new peers were created
     return GetOrCreateResult(
         existing_peers + new_peers,
         created=len(new_peers) > 0,
-        on_commit=_invalidate_peer_cache if _cache_keys_to_invalidate else None,
+        on_commit=_after_commit,
     )
 
 
@@ -415,6 +426,7 @@ async def _fetch_peer(
         select(models.Peer)
         .where(models.Peer.workspace_name == workspace_name)
         .where(models.Peer.name == peer_name)
+        .where(live_peer_row())
     )
     if obj is None:
         return None
@@ -484,7 +496,9 @@ async def get_peers(
             ``{"kind": "scope"}`` internal_metadata flag), "scope" returns only
             scope peers, and "all" returns everything.
     """
-    stmt = select(models.Peer).where(models.Peer.workspace_name == workspace_name)
+    stmt = select(models.Peer).where(
+        models.Peer.workspace_name == workspace_name, live_peer_row()
+    )
 
     if kind is None:
         stmt = stmt.where(~scope_peer_clause())
@@ -598,6 +612,7 @@ async def get_sessions_for_peer(
         )
         .where(models.SessionPeer.peer_name == peer_name)
         .where(models.Session.workspace_name == workspace_name)
+        .where(live_session_row(), live_session_peer_row())
     )
 
     stmt = apply_filter(stmt, models.Session, filters)

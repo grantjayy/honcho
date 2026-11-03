@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/)
 and this project adheres to [Semantic Versioning](http://semver.org/).
 
+## [2.8.0] - 2026-10-29
+
+### Added
+
+- `honcho.sessions()` takes `scope`, `in_no_scope` and `include_scopes` (sync and async). `scope` lists only that scope's sessions, `in_no_scope=True` only sessions in no scope, and `include_scopes=True` sets `Session.scopes` (and `SessionResponse.scopes`) to the names of the scopes each listed session is in. Requires Honcho v3.5.0+ (#1477)
+- `honcho.scopes()` takes `filters` (e.g. `{"id": {"icontains": "sup"}}`, matching the scope name) and `include_session_count` (sync and async). With `include_session_count=True`, `Scope.session_count` (and `ScopeResponse.session_count`) holds each listed scope's member session count. Requires Honcho v3.5.0+ (#1478)
+- `Scope.remove_sessions()` (sync and async) removes up to 100 sessions from a scope in one request. All-or-nothing if any session doesn't exist; sessions that aren't members are ignored. Requires Honcho v3.5.0+ (#1480)
+- `Conclusion.source_message_ids`: the messages the deriver cited as evidence for an explicit conclusion (Honcho v3.5.0+). None for derived levels, and for conclusions recorded before citations existed until a later derivation of the same conclusion merges citations into them. Filter with `{"source_message_ids": {"contains": "<message_id>"}}` to find the conclusions that cite a message as evidence (#935)
+
+### Changed
+
+- `set_configuration()` on the client replaces the whole workspace configuration (Honcho v3.5.0+), so `set_configuration(WorkspaceConfiguration())` clears explicit settings and uses system defaults; settings left out are removed. `refresh()` on the client reloads its typed configuration along with metadata (#1458)
+
+### Security
+
+- Requires `certifi` 2026.10.19 or newer, the first CA bundle without the emSign root behind the compromised eMudhra intermediates. The client verifies TLS with httpx's default, which reads certifi, so upgrading the SDK now upgrades the bundle in the app's environment too. An app that pins an older `certifi` must raise that pin to upgrade (#1453)
+
+## [2.7.0] - 2026-10-20
+
+### Added
+
+- `uid` on `Peer`, `Session` and the `Honcho` client (the workspace), plus on `PeerResponse`, `SessionResponse` and `WorkspaceResponse`: the immutable identifier the server assigns, next to the client-chosen `id`. Set from any API response that returns the object, and `None` before the first fetch or against servers that don't return it (#1394)
+
+### Fixed
+
+- The async client (`.aio`) builds a new `httpx.AsyncClient` when the running event loop changes, instead of reusing the first loop's client on every later loop. A `Honcho` kept across `asyncio.run()` calls (a module-level client in a Lambda handler, a sync view or a CLI) no longer fails its first request on a new loop with `ConnectionError: Event loop is closed` when the previous loop left a pooled connection, sometimes after the write had been stored. A client set directly on `_async_http` is still used as is, and each thread running its own loop should use its own `Honcho` (#1357)
+
 ## [2.6.0] - 2026-10-07
 
 ### Added

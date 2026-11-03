@@ -5,8 +5,8 @@ within a peer. Internally a scope is a peer named ``scope.<name>`` that
 observes its member sessions and never speaks; these routes are the facade
 that keeps the observer/observed mechanics hidden.
 
-All scopes routes require a workspace-level (or admin) key: scopes are an
-app-level admin surface, so peer- and session-scoped keys are rejected.
+Scope management requires a workspace-level (or admin) key. Named-scope keys
+can read their own scope, membership, and status; peer/session keys are rejected.
 
 Retroactive membership changes are handled asynchronously: adding a session
 that already has messages enqueues a backfill-by-copy job, removing a session
@@ -77,22 +77,54 @@ async def get_or_create_scope(
 )
 async def get_scopes(
     workspace_id: str = Path(...),
+    options: schemas.ScopeGet | None = Body(
+        None, description="Filtering options for the scopes list"
+    ),
     reverse: bool = Query(False, description="Whether to reverse the order of results"),
+    include_session_count: bool = Query(
+        False,
+        description="Whether to include each scope's member session count as `session_count`",
+    ),
     params: AbstractParams = Depends(pagination_params),
     db: AsyncSession = read_db,
 ):
-    """Get all Scopes for a Workspace. Results are paginated."""
-    return await paginate_offset_or_cursor(
+    """Get all Scopes for a Workspace. Results are paginated.
+
+    Filter by name with `{"filters": {"id": {"icontains": "sup"}}}`; `id` is
+    the unprefixed scope name.
+    """
+    page = await paginate_offset_or_cursor(
         db,
-        await crud.get_scopes(workspace_name=workspace_id, reverse=reverse),
+        await crud.get_scopes(
+            workspace_name=workspace_id,
+            reverse=reverse,
+            filters=options.filters if options and options.filters else None,
+        ),
         params,
     )
+
+    if include_session_count:
+        scopes = [schemas.Scope.model_validate(peer) for peer in page.items]
+        counts = await crud.count_scope_sessions(
+            db, workspace_id, [scope.name for scope in scopes]
+        )
+        page.items = [
+            scope.model_copy(update={"session_count": counts[scope.name]})
+            for scope in scopes
+        ]
+    return page
 
 
 @router.get(
     "/{scope_id}",
     response_model=schemas.Scope,
-    dependencies=[Depends(require_auth(workspace_name="workspace_id"))],
+    dependencies=[
+        Depends(
+            require_auth(
+                workspace_name="workspace_id", scope_name="scope_id", allow_scope=True
+            )
+        )
+    ],
 )
 async def get_scope(
     workspace_id: str = Path(...),
@@ -165,9 +197,46 @@ async def remove_session_from_scope(
 
 
 @router.post(
+    "/{scope_id}/sessions/remove",
+    status_code=204,
+    response_model=None,
+    dependencies=[Depends(require_auth(workspace_name="workspace_id"))],
+)
+async def remove_sessions_from_scope(
+    workspace_id: str = Path(...),
+    scope_id: str = Path(...),
+    body: schemas.ScopeSessionsRemove = Body(
+        ..., description="IDs of the sessions to remove from the scope"
+    ),
+    db: AsyncSession = db,
+):
+    """
+    Remove up to 100 Sessions from a Scope in one request.
+
+    The batch is all-or-nothing: if any named session does not exist, the
+    request returns 404 and no membership changes. Sessions that are not
+    members of the scope are ignored. Each removed session is reconciled
+    asynchronously, exactly as `DELETE /scopes/{scope_id}/sessions/{session_id}`
+    does.
+    """
+    await crud.remove_sessions_from_scope(
+        db,
+        workspace_name=workspace_id,
+        scope_name=scope_id,
+        session_names=body.session_ids,
+    )
+
+
+@router.post(
     "/{scope_id}/sessions/list",
     response_model=Page[schemas.Session] | CursorPage[schemas.Session],
-    dependencies=[Depends(require_auth(workspace_name="workspace_id"))],
+    dependencies=[
+        Depends(
+            require_auth(
+                workspace_name="workspace_id", scope_name="scope_id", allow_scope=True
+            )
+        )
+    ],
 )
 async def get_scope_sessions(
     workspace_id: str = Path(...),
@@ -196,7 +265,13 @@ async def get_scope_sessions(
 @router.get(
     "/{scope_id}/status",
     response_model=schemas.ScopeStatus,
-    dependencies=[Depends(require_auth(workspace_name="workspace_id"))],
+    dependencies=[
+        Depends(
+            require_auth(
+                workspace_name="workspace_id", scope_name="scope_id", allow_scope=True
+            )
+        )
+    ],
     responses={
         404: {"model": schemas.ErrorResponse, "description": "Scope does not exist"},
     },

@@ -145,6 +145,8 @@ class WorkspaceResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True)  # pyright: ignore[reportUnannotatedClassAttribute]
 
     id: str
+    uid: str | None = None
+    """Immutable server-assigned identifier. ``None`` on servers that predate it."""
     metadata: dict[str, Any] = Field(default_factory=dict)
     configuration: WorkspaceConfigurationResponse = Field(
         default_factory=WorkspaceConfigurationResponse
@@ -192,6 +194,8 @@ class PeerResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True)  # pyright: ignore[reportUnannotatedClassAttribute]
 
     id: str
+    uid: str | None = None
+    """Immutable server-assigned identifier. ``None`` on servers that predate it."""
     workspace_id: str
     created_at: datetime.datetime
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -271,6 +275,8 @@ class SessionResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True)  # pyright: ignore[reportUnannotatedClassAttribute]
 
     id: str
+    uid: str | None = None
+    """Immutable server-assigned identifier. ``None`` on servers that predate it."""
     is_active: bool
     workspace_id: str
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -278,6 +284,8 @@ class SessionResponse(BaseModel):
         default_factory=SessionConfigurationResponse
     )
     created_at: datetime.datetime
+    scopes: list[str] | None = None
+    """Active scope names. Only returned by the session list with ``include_scopes``."""
 
 
 class SessionCreateParams(BaseModel):
@@ -322,6 +330,8 @@ class ScopeResponse(BaseModel):
     id: str
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime.datetime
+    session_count: int | None = None
+    """Active member sessions. Only returned by the scope list with ``include_session_count``."""
 
 
 class ScopeBackfillJob(BaseModel):
@@ -472,6 +482,7 @@ class ConclusionResponse(BaseModel):
     session_id: str | None = None
     level: ConclusionLevel = "explicit"
     source_ids: list[str] | None = None
+    source_message_ids: list[str] | None = None
     times_derived: int = 1
     created_at: datetime.datetime
 

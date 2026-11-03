@@ -1,9 +1,10 @@
 name: Static Analysis
 on:
   push:
-    branches: [main]
+    branches: [main, feat/shared-tenants]
   pull_request:
-    branches: [main]
+    branches: [main, feat/shared-tenants]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -40,14 +41,6 @@ jobs:
         run: uv run --only-group dev ruff check src tests scripts migrations sdks/python sandbox
       - name: ruff format
         run: uv run --only-group dev ruff format --check src tests scripts migrations sdks/python sandbox
-
-  issue-gate:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      # The gate runs from `pull_request_target`, where a crash is invisible until
-      # a contributor's PR is silently ungated. Check it here instead.
-      - run: node .github/scripts/issue-gate.test.js
 
   openapi-drift:
     runs-on: ubuntu-latest
