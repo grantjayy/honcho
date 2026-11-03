@@ -13,11 +13,11 @@ from unittest.mock import Mock, patch
 import httpx
 import pytest
 from openai import AsyncOpenAI
-from pydantic import ValidationError
 from tenacity import wait_none
 
 from src.config import ConfiguredModelSettings, FallbackModelSettings
 from src.llm import CLIENTS, api, honcho_llm_call
+from src.llm.structured_output import StructuredOutputError
 from src.utils.representation import PromptRepresentation
 
 PRIMARY = "primary-model"
@@ -129,7 +129,7 @@ async def test_unparseable_output_is_retried_until_valid_json(
 async def test_unparseable_output_on_every_attempt_raises_after_fallback(
     bad_content: str, finish_reason: str, mode: str | None
 ) -> None:
-    with pytest.raises(ValidationError):
+    with pytest.raises(StructuredOutputError):
         await _derive([(bad_content, finish_reason)] * 3, structured_output_mode=mode)
 
 
@@ -149,7 +149,7 @@ async def test_unparseable_output_final_attempt_uses_fallback_config() -> None:
     try:
         with (
             patch.dict(CLIENTS, {"openai": client}),
-            pytest.raises(ValidationError),
+            pytest.raises(StructuredOutputError),
         ):
             await honcho_llm_call(
                 model_config=model_config,
