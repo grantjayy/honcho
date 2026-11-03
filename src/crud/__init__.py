@@ -1,6 +1,9 @@
 from .collection import (
     get_collection,
+    get_collection_internal_metadata_value,
     get_or_create_collection,
+    invalidate_collection_cache,
+    merge_collection_internal_metadata_value,
     update_collection_internal_metadata,
 )
 from .deriver import (
@@ -11,6 +14,7 @@ from .deriver import (
 )
 from .document import (
     CreateDocumentsResult,
+    DocumentLevelSummary,
     create_documents,
     create_observations,
     delete_document,
@@ -24,7 +28,9 @@ from .document import (
     query_documents,
     query_documents_most_derived,
     query_documents_recent,
+    query_explicit_documents_after,
     query_external_vector_document_ids,
+    summarize_documents_by_level,
 )
 from .message import (
     create_messages,
@@ -55,15 +61,19 @@ from .representation import (
 from .scope import (
     add_sessions_to_scope,
     clear_scope_backfill_status,
+    count_scope_sessions,
     get_or_create_scopes,
     get_scope_backfill_status,
     get_scope_or_raise,
     get_scope_sessions,
     get_scopes,
+    get_session_scopes,
     invalidate_scope_peer_cache,
     remove_session_from_scope,
+    remove_sessions_from_scope,
     resolve_scope_peers,
     resolve_scope_session_union,
+    session_in_scope_clause,
     update_scope_backfill_status,
 )
 from .session import (
@@ -109,6 +119,9 @@ __all__ = [
     "get_collection",
     "get_or_create_collection",
     "update_collection_internal_metadata",
+    "get_collection_internal_metadata_value",
+    "invalidate_collection_cache",
+    "merge_collection_internal_metadata_value",
     # Deriver
     "cleanup_stale_work_units",
     "get_deriver_metrics",
@@ -126,6 +139,9 @@ __all__ = [
     "query_documents",
     "query_documents_most_derived",
     "query_documents_recent",
+    "query_explicit_documents_after",
+    "summarize_documents_by_level",
+    "DocumentLevelSummary",
     "query_external_vector_document_ids",
     "delete_document",
     "delete_document_by_id",
@@ -158,15 +174,19 @@ __all__ = [
     # Scope
     "add_sessions_to_scope",
     "clear_scope_backfill_status",
+    "count_scope_sessions",
     "get_or_create_scopes",
     "get_scope_backfill_status",
     "get_scope_or_raise",
     "get_scope_sessions",
     "get_scopes",
+    "get_session_scopes",
     "invalidate_scope_peer_cache",
     "remove_session_from_scope",
+    "remove_sessions_from_scope",
     "resolve_scope_peers",
     "resolve_scope_session_union",
+    "session_in_scope_clause",
     "update_scope_backfill_status",
     # Session
     "SessionDeletionResult",

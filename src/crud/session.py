@@ -35,6 +35,7 @@ from src.cache.client import (
     safe_cache_set,
 )
 from src.config import settings
+from src.crud.lifecycle import live_session_peer_row, live_session_row
 from src.exceptions import (
     AuthenticationException,
     ConflictException,
@@ -42,7 +43,9 @@ from src.exceptions import (
     ResourceNotFoundException,
     ValidationException,
 )
+from src.telemetry.events import SessionCreatedEvent, emit
 from src.utils.filter import apply_filter
+from src.utils.path_params import schema_from_path
 from src.utils.scopes import is_scope_peer, scope_peer_name
 from src.utils.types import GetOrCreateResult
 from src.vector_store import get_external_vector_store
@@ -54,7 +57,11 @@ from .peer import (
     scope_peer_clause,
     scope_peer_names,
 )
-from .scope import SCOPE_MEMBERSHIP_CONFIG, get_or_create_scopes
+from .scope import (
+    SCOPE_MEMBERSHIP_CONFIG,
+    get_or_create_scopes,
+    session_in_scope_clause,
+)
 from .workspace import get_or_create_workspace
 
 logger = getLogger(__name__)
@@ -106,6 +113,7 @@ async def _fetch_session(
         select(models.Session)
         .where(models.Session.workspace_name == workspace_name)
         .where(models.Session.name == session_name)
+        .where(live_session_row())
     )
     if obj is None:
         return None
@@ -164,6 +172,8 @@ async def get_sessions(
     workspace_name: str,
     filters: dict[str, Any] | None = None,
     reverse: bool = False,
+    scope_name: str | None = None,
+    in_no_scope: bool = False,
 ) -> Select[tuple[models.Session]]:
     """
     Get all active sessions in a workspace.
@@ -172,6 +182,9 @@ async def get_sessions(
         workspace_name: Name of the workspace
         filters: Optional filters to apply to the query
         reverse: If True, order by created_at descending; if False, ascending
+        scope_name: Only sessions that are active members of this unprefixed
+            scope. Callers check the scope exists (``get_scope_or_raise``).
+        in_no_scope: Only sessions that are not an active member of any scope
 
     Returns:
         Select statement for Session objects
@@ -180,7 +193,13 @@ async def get_sessions(
         select(models.Session)
         .where(models.Session.workspace_name == workspace_name)
         .where(models.Session.is_active == True)  # noqa: E712
+        .where(live_session_row())
     )
+
+    if scope_name is not None:
+        stmt = stmt.where(session_in_scope_clause(scope_name))
+    elif in_no_scope:
+        stmt = stmt.where(~session_in_scope_clause(None))
 
     stmt = apply_filter(stmt, models.Session, filters)
 
@@ -195,6 +214,7 @@ async def get_or_create_session(
     workspace_name: str,
     *,
     acting_peer: str | None = None,
+    acting_scope: str | None = None,
     _retry: bool = False,
 ) -> GetOrCreateResult[models.Session]:
     """
@@ -214,6 +234,9 @@ async def get_or_create_session(
         acting_peer: Peer a peer-scoped caller acts as. An existing session is
             then only returned to an active member, and its metadata and
             configuration are left untouched.
+        acting_scope: Scope a restricted caller acts within. Only fresh sessions
+            may be enrolled; existing sessions must already be active members,
+            and their metadata, configuration, and peers are left untouched.
         _retry: Whether to retry after a concurrent create conflict
 
     Returns:
@@ -222,8 +245,9 @@ async def get_or_create_session(
     Raises:
         ValueError: If session.name is empty
         ResourceNotFoundException: If the named session exists but is inactive
-        AuthenticationException: If ``acting_peer`` is not a member of the
-            existing session, or tries to change its metadata or configuration
+        AuthenticationException: If ``acting_peer`` or ``acting_scope`` is not
+            a member of the existing session, or tries to change its metadata
+            or configuration (or, for ``acting_scope``, its peers)
         ObserverException: If adding peers would exceed the observer limit
         ConflictException: If concurrent creation prevents fetching or creating
             the session
@@ -264,7 +288,7 @@ async def get_or_create_session(
         # Get or create workspace to ensure it exists
         ws_result = await get_or_create_workspace(
             db,
-            schemas.WorkspaceCreate(name=workspace_name),
+            schema_from_path(schemas.WorkspaceCreate, "workspace_id", workspace_name),
         )
 
         # Create honcho session
@@ -291,9 +315,32 @@ async def get_or_create_session(
                     f"Unable to create or get session: {session.name}"
                 ) from None
             return await get_or_create_session(
-                db, session, workspace_name, acting_peer=acting_peer, _retry=True
+                db,
+                session,
+                workspace_name,
+                acting_peer=acting_peer,
+                acting_scope=acting_scope,
+                _retry=True,
             )
     else:
+        if acting_scope is not None:
+            if not await is_peer_in_session(
+                db, workspace_name, session.name, scope_peer_name(acting_scope)
+            ):
+                raise AuthenticationException("JWT not permissioned for this resource")
+            # Edits go through the dedicated session routes, which scope keys
+            # cannot reach; adding peers would also grant them member read.
+            if (
+                session.metadata is not None
+                or session.configuration is not None
+                or session.peer_names
+            ):
+                raise AuthenticationException(
+                    "Scope-scoped keys cannot modify an existing session"
+                )
+            # Never upsert this membership: a removal after the check must not
+            # be undone by create-or-get, nor trigger a new backfill.
+            session.scopes = None
         # Checked here rather than in the handler so a session created between
         # the handler's check and this read cannot be joined or modified.
         if acting_peer is not None:
@@ -377,6 +424,12 @@ async def get_or_create_session(
         await peers_result.post_commit()
     if scopes_result is not None:
         await scopes_result.post_commit()
+    if created:
+        emit(
+            SessionCreatedEvent(
+                workspace_name=workspace_name, session_name=session.name
+            )
+        )
 
     # Backfill (DEV-1999): a pre-existing session added to scopes at
     # create-or-get time may already have messages; those need a
@@ -500,7 +553,9 @@ async def update_session(
     """
     honcho_session: models.Session = (
         await get_or_create_session(
-            db, schemas.SessionCreate(name=session_name), workspace_name=workspace_name
+            db,
+            schema_from_path(schemas.SessionCreate, "session_id", session_name),
+            workspace_name=workspace_name,
         )
     ).resource
 
@@ -721,6 +776,18 @@ async def delete_session(
                         f"Failed to delete document vectors from {namespace}: {e}"
                     )
 
+        # Delete SessionPeer associations before the documents. A scope_removal
+        # task locks the scope's membership row and then updates this session's
+        # documents; taking the same rows in the opposite order here could
+        # deadlock against it. Nothing references session_peers, so this is
+        # safe ahead of the rows below, and all of it commits together.
+        await db.execute(
+            delete(models.SessionPeer).where(
+                models.SessionPeer.session_name == session_name,
+                models.SessionPeer.workspace_name == workspace_name,
+            )
+        )
+
         # Delete Document entries associated with this session in batches
         conclusions_deleted = await _batch_delete_matching(
             db,
@@ -741,14 +808,6 @@ async def delete_session(
                 models.Message.workspace_name == workspace_name,
             ],
             batch_size=5000,
-        )
-
-        # Delete SessionPeer associations
-        await db.execute(
-            delete(models.SessionPeer).where(
-                models.SessionPeer.session_name == session_name,
-                models.SessionPeer.workspace_name == workspace_name,
-            )
         )
 
         # Finally, delete the session itself
@@ -882,6 +941,11 @@ async def clone_session(
         db.add(new_session_peer)
 
     await db.commit()
+    emit(
+        SessionCreatedEvent(
+            workspace_name=workspace_name, session_name=new_session.name
+        )
+    )
     logger.debug("Session %s cloned successfully", original_session_name)
 
     # Cache will be populated on next read - read-through pattern
@@ -996,6 +1060,7 @@ async def get_peers_from_session(
         .where(models.SessionPeer.session_name == session_name)
         .where(models.Peer.workspace_name == workspace_name)
         .where(models.SessionPeer.left_at.is_(None))  # Only active peers
+        .where(live_session_peer_row())
         # models.Peer is already in the FROM via the join above, so the clause
         # composes directly — no correlated exists() as in the SessionPeer-only
         # UPDATE statements elsewhere in this module.
@@ -1032,6 +1097,7 @@ async def is_peer_in_session(
         .where(models.SessionPeer.session_name == session_name)
         .where(models.SessionPeer.peer_name == peer_name)
         .where(models.SessionPeer.left_at.is_(None))
+        .where(live_session_peer_row())
         .limit(1)
     )
     return result is not None
@@ -1394,6 +1460,7 @@ async def get_peer_config(
         models.SessionPeer.workspace_name == workspace_name,
         models.SessionPeer.session_name == session_name,
         models.SessionPeer.peer_name == peer_id,
+        live_session_peer_row(),
     )
     result = await db.execute(stmt)
     session_peer = result.scalar_one_or_none()

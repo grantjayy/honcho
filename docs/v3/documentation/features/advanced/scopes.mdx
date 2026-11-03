@@ -48,9 +48,112 @@ graph TB
   that name it; it does not hide the sessions from requests that don't.
 
 <Warning>
-Scopes are a recall boundary, not an authorization boundary. Who may call the
-API is still governed by workspace, session, and peer keys.
+Passing a scope option with a workspace/admin key is cooperative filtering.
+A named-scope key enforces the boundary on the server, even when the caller
+omits the option. Existing admin, workspace, peer, and session keys keep their
+authorization behavior; they do not need to be replaced.
 </Warning>
+
+## Named-scope API keys
+
+With authentication enabled, an admin can mint a key bound to one named scope:
+
+```bash
+curl -X POST "$HONCHO_BASE_URL/v3/keys?workspace_id=company&scope_id=support" \
+  -H "Authorization: Bearer $HONCHO_ADMIN_KEY"
+```
+
+Create the workspace and scope with a privileged key before using the restricted
+key. The key can recall **and ingest**; there are no read-only/write-only roles.
+It carries `w` (workspace), `sc` (unprefixed scope name), and the audience
+`honcho:named-scope`, optionally `exp`.
+It cannot also carry an admin grant, peer, or session restriction. Existing JWT
+claims and minting parameters are unchanged.
+
+For self-hosting, the signing script also supports this key type:
+
+```bash
+uv run python scripts/generate_jwt.py --workspace company --scope support --expires 8h
+```
+
+These are core Honcho JWTs. Honcho Cloud's managed `hch-` keys require separate
+gateway support for named-scope grants; do not assume a core JWT can be
+used at `api.honcho.dev` or that the managed key endpoint preserves `scope_id`.
+Use an instance running this core implementation directly until managed support
+is available. Upgrade **every** API replica before issuing scope keys. Older
+servers reject the dedicated audience, so a mixed-version fleet or rollback
+rejects new scope keys rather than widening their access. Existing keys continue
+working on both versions without rotation. Tokens with `sc` but without the
+dedicated audience are rejected by the new server as well.
+
+| Operation | With a named-scope key |
+|---|---|
+| Peer chat, streaming chat, representation | Automatically use the key's named projection; another scope or a list is rejected |
+| Session context | Requires active membership; target representation and card use the key's projection |
+| Messages: create, upload, list, get, update metadata | Allowed in active member sessions |
+| Session summaries and message search | Allowed in active member sessions |
+| Create/get session | A fresh session joins the key's scope; an existing session must already be an active member, and the call cannot change its metadata, configuration, or peers |
+| Get scope, list its sessions, backfill status | Only the key's scope |
+| Add/remove scope membership, create scopes, mint keys | Requires a privileged key |
+| Workspace-wide recall/listing, global peer context/cards, generic conclusions, other resource management | Rejected |
+
+For recall, omit `scope` or pass exactly the key's scope name as a string.
+`filters`/`session_id` cannot replace that projection, and session context rejects
+`sessions`, `limit_to_session`, or `peer_perspective` overrides. A scope key may
+query any target peer, but only through what its scope knows about that target.
+An empty scope has no evidence; it never falls back to a global view.
+
+On session creation, omit `scopes` or pass exactly `["support"]`. Naming an
+existing unrelated session cannot enroll it. Message authors are ordinary peers,
+created as needed through ingestion; scope peers cannot author messages. A
+session shared by multiple scopes is one underlying conversation: writes feed
+all its observers. Scope keys are trusted writers for their member sessions.
+
+The current high-level SDK/CLI helpers attempt workspace provisioning, including
+before many reads. A named-scope key correctly rejects that global operation.
+Use the SDK's HTTP transport or REST for scope-key operations until those helpers
+support restricted credentials. Existing high-level clients with existing key
+types are unchanged. For Python:
+
+```python
+import os
+from honcho.http import HonchoHTTPClient
+
+client = HonchoHTTPClient(
+    api_key=os.environ["HONCHO_SCOPE_KEY"],
+    base_url=os.environ["HONCHO_BASE_URL"],
+)
+root = "/v3/workspaces/company"
+client.post(f"{root}/sessions", body={"id": "support-thread"})
+client.post(f"{root}/sessions/support-thread/messages", body={"messages": [
+    {"peer_id": "alice", "content": "I prefer concise technical answers."}
+]})
+answer = client.post(f"{root}/peers/alice/chat", body={
+    "query": "How should I explain this to Alice?"
+})
+context = client.get(f"{root}/sessions/support-thread/context", query={
+    "peer_target": "alice"
+})
+client.close()
+```
+
+In TypeScript, use the public `client.http` transport for these endpoints.
+Direct `new Peer(id, client.workspaceId, client.http)` and
+`new Session(id, client.workspaceId, client.http)` handles also avoid the factory's
+workspace provisioning callback. Do not catch a scope-key rejection and retry
+with a broader credential.
+
+Membership is checked on each session request. Removing a session immediately
+denies subsequent direct session reads and writes and excludes it from raw
+message recall. **Learned memory cleanup remains asynchronous**: existing
+conclusions and cards may contain removed evidence until reconciliation finishes.
+Requests already in flight and application caches are not retroactively erased.
+Applications needing immediate revocation must suspend affected scope recall,
+invalidate cached context, and wait for verified cleanup or rebuild a fresh scope.
+
+JWTs retain existing expiration and signing-secret semantics; this change does
+not add a token revocation registry. Prefer expiring grants. Scope IDs should
+not be reused to repurpose an outstanding grant.
 
 ## The Two Arms
 
@@ -128,6 +231,10 @@ for s in therapy.sessions():
 
 therapy.remove_session("therapy-session-1")
 
+# Or remove up to 100 at once — all-or-nothing if any session doesn't exist;
+# sessions that aren't members are ignored
+therapy.remove_sessions(["therapy-session-2", "therapy-session-3"])
+
 for scope in honcho.scopes():
     print(scope.id, scope.metadata)
 ```
@@ -158,6 +265,10 @@ for await (const s of await therapy.sessions()) {
 
 await therapy.removeSession("therapy-session-1");
 
+// Or remove up to 100 at once — all-or-nothing if any session doesn't exist;
+// sessions that aren't members are ignored
+await therapy.removeSessions(["therapy-session-2", "therapy-session-3"]);
+
 for await (const scope of await honcho.scopes()) {
   console.log(scope.id, scope.metadata);
 }
@@ -187,6 +298,13 @@ curl -X POST "$HONCHO_URL/v3/workspaces/my-app/scopes/therapy/sessions/list" \
 # Remove one session
 curl -X DELETE "$HONCHO_URL/v3/workspaces/my-app/scopes/therapy/sessions/therapy-session-1" \
   -H "Authorization: Bearer $HONCHO_API_KEY"
+
+# Remove up to 100 sessions (404 and no change if any doesn't exist;
+# non-members are ignored)
+curl -X POST "$HONCHO_URL/v3/workspaces/my-app/scopes/therapy/sessions/remove" \
+  -H "Authorization: Bearer $HONCHO_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"session_ids": ["therapy-session-2", "therapy-session-3"]}'
 ```
 </CodeGroup>
 
@@ -196,12 +314,99 @@ call returns it, and any `metadata` you pass is written onto it. When a lookup
 must not create a scope — resolving a user-supplied name, for example — use
 `get_scope` / `getScope` instead, which fails with a not-found error.
 
+### Searching and Counting Scopes
+
+The scope list can filter by name and report how many sessions each scope
+holds, so a client never has to load every scope or list each one's members:
+
+<CodeGroup>
+```python Python
+# `id` matches the scope name (never the internal prefix)
+for scope in honcho.scopes({"id": {"icontains": "sup"}}, include_session_count=True):
+    print(scope.id, scope.session_count)
+```
+
+```typescript TypeScript
+const scopes = await honcho.scopes({
+  filters: { id: { icontains: "sup" } },
+  includeSessionCount: true,
+});
+for await (const scope of scopes) {
+  console.log(scope.id, scope.sessionCount);
+}
+```
+
+```bash REST
+curl -X POST "$HONCHO_URL/v3/workspaces/my-app/scopes/list?include_session_count=true" \
+  -H "Authorization: Bearer $HONCHO_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"filters": {"id": {"icontains": "sup"}}}'
+```
+</CodeGroup>
+
+`session_count` counts the sessions `scopes/{id}/sessions/list` would return,
+and is omitted unless requested. The name filter takes the same operators as
+other list filters (`icontains`, `contains`, `in`, AND/OR/NOT), plus
+`created_at` and `metadata`; `total` counts the filtered scopes.
+
 <Note>
 Every scopes route — and every read that passes `scope` — requires a
 **workspace-level or admin key**. A scope's membership can exceed any single
 peer's own session membership, so peer- and session-scoped keys are rejected
 with `401`.
 </Note>
+
+### Listing Membership From the Session Side
+
+The workspace session list can answer the reverse question — which scopes is
+this session in? — without listing every scope's members:
+
+<CodeGroup>
+```python Python
+# Each listed session's `scopes` holds its scope names, sorted ([] for none)
+for s in honcho.sessions(include_scopes=True):
+    print(s.id, s.scopes)
+
+# Only the sessions in one scope, or only the sessions in no scope
+therapy_sessions = honcho.sessions(scope="therapy")
+unscoped = honcho.sessions(in_no_scope=True)
+```
+
+```typescript TypeScript
+// Each listed session's `scopes` holds its scope names, sorted ([] for none)
+for await (const s of await honcho.sessions({ includeScopes: true })) {
+  console.log(s.id, s.scopes);
+}
+
+// Only the sessions in one scope, or only the sessions in no scope
+const therapySessions = await honcho.sessions({ scope: "therapy" });
+const unscoped = await honcho.sessions({ inNoScope: true });
+```
+
+```bash REST
+# Each session in the page carries `scopes`: its active scope names, sorted
+# ([] for a session in no scope). Without the flag, sessions have no `scopes` key.
+curl -X POST "$HONCHO_URL/v3/workspaces/my-app/sessions/list?include_scopes=true" \
+  -H "Authorization: Bearer $HONCHO_API_KEY"
+
+# Only the sessions in one scope (404 if the scope doesn't exist)
+curl -X POST "$HONCHO_URL/v3/workspaces/my-app/sessions/list" \
+  -H "Authorization: Bearer $HONCHO_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"scope": "therapy"}'
+
+# Only the sessions in no scope
+curl -X POST "$HONCHO_URL/v3/workspaces/my-app/sessions/list" \
+  -H "Authorization: Bearer $HONCHO_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"in_no_scope": true}'
+```
+</CodeGroup>
+
+`scope` and `in_no_scope` are mutually exclusive, and both combine with
+`filters`, pagination and `include_scopes`. The page's `total` counts the
+filtered sessions, so `{"in_no_scope": true}` with `size=1` tells you how many
+sessions are in no scope.
 
 ## Membership Changes Copy, They Don't Re-Derive
 

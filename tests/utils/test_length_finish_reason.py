@@ -2,8 +2,8 @@
 Tests for JSON repair handling across all providers in honcho_llm_call_inner,
 and Gemini thinking budget support.
 
-Verifies that when an LLM hits the max token limit or returns malformed JSON,
-the truncated output is repaired and returned instead of crashing.
+Verifies that truncated JSON is repaired when possible and malformed structured
+output raises a safe error.
 """
 
 import json
@@ -20,8 +20,8 @@ from openai.types.chat.chat_completion_message import ChatCompletionMessage
 from openai.types.completion_usage import CompletionUsage
 from pydantic import BaseModel, ValidationError
 
-from src.exceptions import ValidationException
 from src.llm import CLIENTS, HonchoLLMCallResponse, honcho_llm_call_inner
+from src.llm.structured_output import StructuredOutputError
 from src.utils.representation import PromptRepresentation
 
 # --- Test models ---
@@ -177,8 +177,7 @@ class TestOpenAILengthFinishReasonRepair:
         assert len(response.content.explicit) >= 1
         assert response.finish_reasons == ["length"]
 
-    async def test_completely_broken_json_raises(self) -> None:
-        """Unrepairable non-empty text raises so honcho_llm_call can retry it."""
+    async def test_completely_broken_json_raises_safe_error(self) -> None:
         mock_client = AsyncMock(spec=AsyncOpenAI)
         mock_client.chat.completions.parse = _raise_length_error(
             "this is not json at all just random text"
@@ -186,7 +185,7 @@ class TestOpenAILengthFinishReasonRepair:
 
         with (
             patch.dict(CLIENTS, {"openai": mock_client}),
-            pytest.raises(ValidationError),
+            pytest.raises(StructuredOutputError),
         ):
             await honcho_llm_call_inner(
                 provider="openai",
@@ -197,15 +196,19 @@ class TestOpenAILengthFinishReasonRepair:
                 json_mode=True,
             )
 
-    async def test_empty_content_raises_for_retry(self) -> None:
-        """Truncated empty content (all tokens spent reasoning) raises so the
-        retry/fallback chain runs instead of saving zero observations."""
+    async def test_empty_truncated_content_raises_safe_error(self) -> None:
+        """Truncated empty content (all tokens spent reasoning) raises an error
+        that names the cause, so the retry/fallback chain runs and the log
+        does not read as a JSON repair failure."""
         mock_client = AsyncMock(spec=AsyncOpenAI)
         mock_client.chat.completions.parse = _raise_length_error("")
 
         with (
             patch.dict(CLIENTS, {"openai": mock_client}),
-            pytest.raises(ValidationException),
+            pytest.raises(
+                StructuredOutputError,
+                match="test-model hit max_tokens before producing output",
+            ),
         ):
             await honcho_llm_call_inner(
                 provider="openai",
@@ -308,15 +311,14 @@ class TestAnthropicJsonRepair:
         assert isinstance(response.content, PromptRepresentation)
         assert len(response.content.explicit) >= 1
 
-    async def test_broken_anthropic_response_raises(self) -> None:
-        """Unrepairable non-empty Anthropic text raises so it can be retried."""
+    async def test_broken_anthropic_response_raises_safe_error(self) -> None:
         mock_client = _make_anthropic_mock(
             "random gibberish that is not json", stop_reason="max_tokens"
         )
 
         with (
             patch.dict(CLIENTS, {"anthropic": mock_client}),
-            pytest.raises(ValidationError),
+            pytest.raises(StructuredOutputError),
         ):
             await honcho_llm_call_inner(
                 provider="anthropic",
@@ -381,8 +383,7 @@ class TestGeminiJsonRepair:
         assert isinstance(response.content, PromptRepresentation)
         assert len(response.content.explicit) == 2
 
-    async def test_gemini_broken_text_raises(self) -> None:
-        """Gemini broken text with no parsed content raises so it can be retried."""
+    async def test_gemini_broken_text_raises_safe_error(self) -> None:
         from google import genai
 
         mock_client = _make_gemini_mock(
@@ -392,7 +393,7 @@ class TestGeminiJsonRepair:
 
         with (
             patch.dict(CLIENTS, {"gemini": mock_client}),
-            pytest.raises(ValidationError),
+            pytest.raises(StructuredOutputError),
         ):
             await honcho_llm_call_inner(
                 provider="gemini",

@@ -275,7 +275,7 @@ The Honcho session name determines which conversation bucket memory lands in. Re
 
 | Priority | Source | Example session name |
 |----------|--------|---------------------|
-| 1 | Gateway session key (Telegram, Discord, etc.) | `"agent-main-telegram-dm-8439114563"` |
+| 1 | Messaging-platform gateway session key (Telegram, Discord, etc.) | `"agent-main-telegram-dm-8439114563"` |
 | 2 | `per-session` strategy | Hermes session ID (`20260415_a3f2b1`) |
 | 3 | Manual map (`sessions` config) | `"myproject-main"` |
 | 4 | Explicit `/title` command (non-automatic title) | `"refactor-auth"` |
@@ -283,7 +283,7 @@ The Honcho session name determines which conversation bucket memory lands in. Re
 | 6 | `per-directory` strategy | Directory basename (`my-project`) |
 | 7 | `global` strategy | Workspace name |
 
-Messaging gateway platforms always resolve via priority 1 (per-chat isolation) regardless of `sessionStrategy`. The strategy setting controls non-gateway sessions such as CLI and Desktop.
+Messaging gateway platforms always resolve via priority 1 (per-chat isolation) regardless of `sessionStrategy`: every Telegram or Discord chat shares the gateway's launch directory, so no directory strategy could tell them apart. The strategy setting controls Hermes' own surfaces (CLI, TUI, Desktop, ACP). Those chats now run inside the gateway runtime too and carry a `local` session key (`agent:main:local:dm:local-<sha>`), but each has its own frozen workspace, so that key is skipped and priorities 2 to 7 apply as before. A `per-session` strategy still gives each of them its own Honcho session through priority 2.
 
 Directory strategies and manual mappings use the logical session workspace, not the backend process's launch directory. Desktop/TUI and ACP pass the workspace during agent construction; deferred Desktop/TUI builds use the same session cwd. With no non-empty construction cwd, Honcho uses the runtime resolver: session cwd context, scoped `terminal.cwd`, then the launch directory. No process-wide `chdir` is needed.
 
@@ -364,8 +364,8 @@ Host key is derived from the active Hermes profile: `hermes` (default) or `herme
 | `injection.sessionStart` | list | unset | Which base-context sections to inject: any of `summary`, `peerRepresentation`, `peerCard`, `aiRepresentation`, `aiCard`. Unset injects all of them in that order. `[]` injects nothing. A host block with an `injection` object replaces the root pin wholesale |
 | `logging` | bool | `false` | Append one JSON record per turn to `~/.honcho/injection.log` saying what was injected and why. The file is owner-only and holds the user's representation verbatim. `HONCHO_LOGGING=1` also switches it on and `HONCHO_INJECTION_LOG=<path>` moves it |
 | `queryRewrite` | bool | `false` | Rewrite the latest message into a retrieval query before dialectic (one extra auxiliary LLM call per cycle) |
-| `firstTurnBaseWait` | float | `3.0` | Max seconds turn 1 waits for base context / session init. `0` disables the wait (fully async; context surfaces on later turns). Turns 2+ never wait on a stalled init |
-| `firstTurnDialecticWait` | float | `2.0` | Max seconds turn 1 waits for a dialectic result. `0` disables |
+| `firstTurnBaseWait` | float | `3.0` | Max seconds a process's first turn waits for base context / session init: turn 1, or the first turn of `hermes chat --resume`, which recalls on the previous user message. The wait runs before Hermes' prefetch timeout starts, so values above it hold. `0` disables the wait (fully async; context surfaces on later turns). Later turns never wait on a stalled init |
+| `firstTurnDialecticWait` | float | `2.0` | Max seconds a process's first turn waits for a dialectic result, after the base wait. `0` disables |
 
 ### Observation (Granular)
 
@@ -471,3 +471,18 @@ Presets:
   }
 }
 ```
+
+## Development
+
+The unit tests run against a pinned Hermes install (the plugin imports Hermes core
+modules) and make no network calls:
+
+```bash
+cd hermes-plugin-honcho/tests
+uv run pytest
+```
+
+The Hermes pin is the `hermes-agent` entry in `tests/pyproject.toml`; bump it together
+with `uv lock` in `tests/`. Keep test dependencies out of the plugin's own
+`pyproject.toml`: Hermes locks that file, and a `hermes-agent` entry there breaks every
+install.
