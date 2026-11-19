@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import (
 from src import models
 from src.config import settings
 from src.crud import document as document_crud
-from src.db import ReadSessionLocal, SessionLocal, connect_args, engine
+from src.db import connect_args, engine, read_engine
 
 _DIMENSIONS = settings.EMBEDDING.VECTOR_DIMENSIONS
 
@@ -37,12 +37,13 @@ def _vector(*components: tuple[int, float]) -> list[float]:
 
 @pytest.mark.asyncio
 async def test_app_sessions_use_relaxed_order_iterative_scan() -> None:
+    # The session-scoped db_engine fixture rebinds SessionLocal and
+    # ReadSessionLocal to a test engine, so check the production engines the
+    # app's sessionmakers are built on, not the sessionmakers' current binds.
     try:
-        for session_factory in (SessionLocal, ReadSessionLocal):
-            async with session_factory() as session:
-                value = (
-                    await session.execute(text("SHOW hnsw.iterative_scan"))
-                ).scalar()
+        for app_engine in (engine, read_engine):
+            async with app_engine.connect() as conn:
+                value = (await conn.execute(text("SHOW hnsw.iterative_scan"))).scalar()
             assert value == "relaxed_order"
     finally:
         await engine.dispose()
