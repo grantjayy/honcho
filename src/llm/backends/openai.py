@@ -72,6 +72,20 @@ def _json_object_instruction(
     return instruction
 
 
+def _unparseable_body(exc: ValidationError) -> str | None:
+    """Recover the model's output from a parse() validation error.
+
+    parse() discards the response when validation fails, so the error is all
+    that is left of it. Only invalid JSON carries the whole body; a schema
+    failure carries just the offending sub-value, which is not the output.
+    """
+    for error in exc.errors(include_url=False):
+        body = error.get("input")
+        if error["type"] == "json_invalid" and isinstance(body, str):
+            return body
+    return None
+
+
 def _uses_max_completion_tokens(model: str) -> bool:
     """OpenAI reasoning models (gpt-5+ family + o-series) require
     ``max_completion_tokens`` instead of the classic ``max_tokens`` parameter.
@@ -264,7 +278,8 @@ class OpenAIBackend:
                 raise StructuredOutputError(
                     "PromptRepresentation structured output failed "
                     + f"failure_class=ValidationError model={model} "
-                    + f"error_count={exc.error_count()}"
+                    + f"error_count={exc.error_count()}",
+                    raw_content=_unparseable_body(exc),
                 ) from None
             except BadRequestError:
                 # A 400 means the provider rejected the request shape — most
@@ -466,18 +481,32 @@ class OpenAIBackend:
             for tool_call in message.tool_calls:
                 tool_input: dict[str, Any] = {}
                 if tool_call.function.arguments:
+                    # Don't log the raw arguments payload — LLM-generated
+                    # tool calls can mirror user PII from the prompt into
+                    # their arguments, and this runs at WARN level.
                     try:
-                        tool_input = json.loads(tool_call.function.arguments)
+                        decoded = json.loads(tool_call.function.arguments)
                     except (json.JSONDecodeError, TypeError) as exc:
-                        # Don't log the raw arguments payload — LLM-generated
-                        # tool calls can mirror user PII from the prompt into
-                        # their arguments, and this runs at WARN level.
                         logger.warning(
                             "Malformed tool arguments for %s (id=%s): %s",
                             tool_call.function.name,
                             tool_call.id,
                             exc.__class__.__name__,
                         )
+                    else:
+                        # Some OpenAI-compatible servers double-encode the
+                        # arguments, which decode to a string. Tool input is
+                        # an object; anything else goes to the tool as {} and
+                        # it reports the missing arguments to the model.
+                        if isinstance(decoded, dict):
+                            tool_input = cast(dict[str, Any], decoded)
+                        else:
+                            logger.warning(
+                                "Tool arguments for %s (id=%s) are %s, not an object",
+                                tool_call.function.name,
+                                tool_call.id,
+                                type(decoded).__name__,
+                            )
                 tool_calls.append(
                     ToolCallResult(
                         id=tool_call.id,

@@ -15,7 +15,16 @@ from sqlalchemy.sql.functions import func
 
 from src import models, schemas
 from src.config import settings
-from src.crud.collection import get_or_create_collection
+from src.crud.collection import get_or_create_collection, record_explicit_documents
+from src.crud.dream_history import (
+    CreatedConclusion,
+    DreamHistoryTarget,
+    RemovedConclusion,
+    erase_conclusion_history,
+    record_created,
+    record_removed,
+)
+from src.crud.lifecycle import live_document_row
 from src.crud.peer import get_peer, reject_scope_observed
 from src.crud.session import get_session
 from src.dependencies import tracked_db
@@ -27,6 +36,7 @@ from src.embedding_client import (
 from src.exceptions import (
     ResourceNotFoundException,
     ValidationException,
+    VectorNamespaceUnresolved,
     VectorStoreError,
 )
 from src.utils.filter import apply_filter
@@ -36,6 +46,7 @@ from src.vector_store import (
     VectorStore,
     get_external_vector_store,
 )
+from src.vector_store.tenant_namespace import prefix_for_tenant
 
 logger = getLogger(__name__)
 
@@ -107,10 +118,11 @@ def get_all_documents(
     """
     stmt = (
         select(models.Document)
+        .where(models.Document.tenant_id == models.scoped_tenant_id())
         .where(models.Document.workspace_name == workspace_name)
         .where(models.Document.observer == observer)
         .where(models.Document.observed == observed)
-        .where(models.Document.deleted_at.is_(None))  # Exclude soft-deleted
+        .where(live_document_row(workspace_name))
     )
 
     # Apply additional filters if provided
@@ -150,8 +162,9 @@ def get_documents_with_filters(
     """
     stmt = (
         select(models.Document)
+        .where(models.Document.tenant_id == models.scoped_tenant_id())
         .where(models.Document.workspace_name == workspace_name)
-        .where(models.Document.deleted_at.is_(None))  # Exclude soft-deleted
+        .where(live_document_row(workspace_name))
     )
 
     # Apply additional filters if provided
@@ -193,10 +206,11 @@ async def query_documents_recent(
         Sequence of documents ordered by created_at descending
     """
     stmt = select(models.Document).where(
+        models.Document.tenant_id == models.scoped_tenant_id(),
         models.Document.workspace_name == workspace_name,
         models.Document.observer == observer,
         models.Document.observed == observed,
-        models.Document.deleted_at.is_(None),
+        live_document_row(workspace_name),
     )
 
     if session_name is not None:
@@ -236,7 +250,7 @@ async def summarize_documents_by_level(
             models.Document.workspace_name == workspace_name,
             models.Document.observer == observer,
             models.Document.observed == observed,
-            models.Document.deleted_at.is_(None),
+            live_document_row(workspace_name),
         )
         .group_by(models.Document.level)
     )
@@ -282,7 +296,7 @@ async def query_explicit_documents_after(
         models.Document.observer == observer,
         models.Document.observed == observed,
         models.Document.level == "explicit",
-        models.Document.deleted_at.is_(None),
+        live_document_row(workspace_name),
     ]
     if after is not None:
         conditions.append(
@@ -331,10 +345,11 @@ async def query_documents_most_derived(
     stmt = (
         select(models.Document)
         .where(
+            models.Document.tenant_id == models.scoped_tenant_id(),
             models.Document.workspace_name == workspace_name,
             models.Document.observer == observer,
             models.Document.observed == observed,
-            models.Document.deleted_at.is_(None),
+            live_document_row(workspace_name),
         )
         .order_by(
             models.Document.times_derived.desc(),
@@ -415,7 +430,7 @@ async def query_external_vector_document_ids(
     if external_vector_store is None:
         return []
 
-    namespace = external_vector_store.get_vector_namespace(
+    namespace = await external_vector_store.get_vector_namespace(
         "document", workspace_name, observer, observed
     )
 
@@ -457,7 +472,7 @@ async def fetch_documents_by_ids(
         .where(models.Document.workspace_name == workspace_name)
         .where(models.Document.observer == observer)
         .where(models.Document.observed == observed)
-        .where(models.Document.deleted_at.is_(None))
+        .where(live_document_row(workspace_name))
         .where(models.Document.id.in_(document_ids))
     )
     stmt = apply_filter(stmt, models.Document, filters)
@@ -485,7 +500,7 @@ async def _query_documents_pgvector(
         .where(models.Document.observer == observer)
         .where(models.Document.observed == observed)
         .where(models.Document.embedding.isnot(None))
-        .where(models.Document.deleted_at.is_(None))
+        .where(live_document_row(workspace_name, peer_pair=(observer, observed)))
     )
 
     if max_distance is not None:
@@ -723,6 +738,7 @@ async def create_documents(
     observer: str,
     observed: str,
     deduplicate: bool = False,
+    history: DreamHistoryTarget | None = None,
 ) -> CreateDocumentsResult:
     """
     Create multiple documents with optional duplicate detection.
@@ -738,6 +754,9 @@ async def create_documents(
         observer: Name of the observing peer
         observed: Name of the observed peer
         deduplicate: Enable semantic duplicate detection
+        history: When set, record the created conclusions, and the existing
+            ones that semantic dedup replaced, to this dream run in the same
+            transaction
 
     Returns:
         List of DocumentCreate schemas that were actually inserted (excludes
@@ -1024,6 +1043,7 @@ async def create_documents(
                 replacement_doc.source_message_ids, workspace_name
             )
 
+    replaced_rows: list[models.Document] = []
     try:
         fallback_docs = await _apply_document_row_updates(
             db,
@@ -1031,6 +1051,7 @@ async def create_documents(
             workspace_name=workspace_name,
             observer=observer,
             observed=observed,
+            replaced_out=replaced_rows,
         )
         for fallback_doc in fallback_docs:
             new_doc = _document_model_from_create(
@@ -1044,6 +1065,19 @@ async def create_documents(
             if fallback_doc.embedding:
                 docs_with_embeddings.append((new_doc, fallback_doc.embedding))
         db.add_all(honcho_documents)
+        if history is not None:
+            await _record_created_history(
+                db,
+                history,
+                workspace_name,
+                created=honcho_documents,
+                replaced=replaced_rows,
+                replaced_by={
+                    old_id: pending_by_key.get(key)
+                    for old_id, (_, key) in replaced_by.items()
+                },
+            )
+        await record_explicit_documents(db, honcho_documents)
         # NOTE
         # If the process crashes after this commit but before vector upsert completes,
         # documents will be left in sync_state='pending' with NULL embeddings.
@@ -1069,7 +1103,7 @@ async def create_documents(
                 await db.commit()
             else:
                 # External vector store - upsert and track sync state
-                namespace = external_vector_store.get_vector_namespace(
+                namespace = await external_vector_store.get_vector_namespace(
                     "document",
                     workspace_name,
                     observer,
@@ -1210,6 +1244,7 @@ async def delete_documents(
     observer: str,
     observed: str,
     session_name: str | None = None,
+    history: DreamHistoryTarget | None = None,
 ) -> list[tuple[str, str]]:
     """
     Soft-delete multiple documents in a single UPDATE ... RETURNING statement.
@@ -1218,6 +1253,9 @@ async def delete_documents(
     that matched the workspace/observer/observed filter and were not already
     soft-deleted. IDs that didn't match are silently skipped; callers can diff
     the returned ids against the input to detect misses.
+
+    With ``history``, the deleted rows' content is recorded to that dream run
+    in the same transaction.
     """
     if not document_ids:
         return []
@@ -1236,10 +1274,30 @@ async def delete_documents(
         update(models.Document)
         .where(*conditions)
         .values(deleted_at=func.now())
-        .returning(models.Document.id, models.Document.level)
+        .returning(
+            models.Document.id,
+            models.Document.level,
+            models.Document.content,
+            models.Document.session_name,
+        )
     )
     result = await db.execute(stmt)
     rows = result.all()
+    if history is not None:
+        await record_removed(
+            db,
+            history,
+            workspace_name,
+            [
+                RemovedConclusion(
+                    id=row.id,
+                    level=row.level,
+                    content=row.content,
+                    session_name=row.session_name,
+                )
+                for row in rows
+            ],
+        )
     await db.commit()
     return [(row.id, row.level) for row in rows]
 
@@ -1250,10 +1308,12 @@ async def delete_document_by_id(
     document_id: str,
 ) -> None:
     """
-    Soft-delete a document by ID and workspace.
+    Soft-delete a document by ID and workspace, and erase its history copies.
 
     Sets deleted_at timestamp to mark the document as deleted. The reconciliation
-    job handles vector store cleanup and hard deletion from the database.
+    job handles vector store cleanup and hard deletion from the database. Any
+    copy Representation History kept of it is deleted in the same transaction,
+    so a conclusion a dream already removed can still be erased this way.
 
     Args:
         db: Database session
@@ -1261,7 +1321,8 @@ async def delete_document_by_id(
         document_id: ID of the document to delete
 
     Raises:
-        ResourceNotFoundException: If document not found or doesn't belong to the workspace
+        ResourceNotFoundException: If neither a live document nor a history copy
+            with this ID exists in the workspace
     """
     update_stmt = (
         update(models.Document)
@@ -1273,8 +1334,10 @@ async def delete_document_by_id(
         .values(deleted_at=func.now())
     )
     result = cast(CursorResult[Any], await db.execute(update_stmt))
+    # After the document, the order a dream takes them in when it removes one.
+    erased = await erase_conclusion_history(db, workspace_name, document_id)
 
-    if result.rowcount == 0:
+    if result.rowcount == 0 and erased == 0:
         raise ResourceNotFoundException(
             f"Document {document_id} not found or does not belong to workspace {workspace_name}"
         )
@@ -1409,6 +1472,7 @@ async def create_observations(
 
     try:
         db.add_all(honcho_documents)
+        await record_explicit_documents(db, honcho_documents)
         await db.commit()
         # Refresh all documents to get generated IDs and timestamps
         for doc in honcho_documents:
@@ -1436,7 +1500,7 @@ async def create_observations(
                 observer,
                 observed,
             ), docs_with_embeddings in collection_embeddings.items():
-                namespace = external_vector_store.get_vector_namespace(
+                namespace = await external_vector_store.get_vector_namespace(
                     "document",
                     workspace_name,
                     observer,
@@ -1574,8 +1638,12 @@ async def _apply_document_row_updates(
     workspace_name: str,
     observer: str,
     observed: str,
+    replaced_out: list[models.Document] | None = None,
 ) -> list[schemas.DocumentCreate]:
-    """Lock target rows by id, apply ops, return fallbacks for vanished targets."""
+    """Lock target rows by id, apply ops, return fallbacks for vanished targets.
+
+    Rows a `replace` op soft-deletes are appended to ``replaced_out``.
+    """
     if not ops:
         return []
     # Deadlock fix: lock in id order (IN-clause order is ignored).
@@ -1633,6 +1701,8 @@ async def _apply_document_row_updates(
         if op.kind == "replace":
             if row is not None and row.deleted_at is None:
                 row.deleted_at = now
+                if replaced_out is not None:
+                    replaced_out.append(row)
             continue
         # reinforce
         if op.document_id in stale_at_lock:
@@ -1652,6 +1722,55 @@ async def _apply_document_row_updates(
             )
     await db.flush()
     return fallbacks
+
+
+async def _record_created_history(
+    db: AsyncSession,
+    history: DreamHistoryTarget,
+    workspace_name: str,
+    *,
+    created: list[models.Document],
+    replaced: list[models.Document],
+    replaced_by: dict[str, models.Document | None],
+) -> None:
+    """Record a dream's created and dedup-replaced conclusions before commit."""
+    # New rows get their ids at flush.
+    await db.flush()
+    await record_created(
+        db,
+        history,
+        workspace_name,
+        [
+            CreatedConclusion(
+                id=doc.id,
+                level=doc.level,
+                source_ids=[
+                    link.source_id
+                    for link in sorted(doc.source_links, key=lambda link: link.position)
+                ],
+            )
+            for doc in created
+        ],
+    )
+    await record_removed(
+        db,
+        history,
+        workspace_name,
+        [
+            RemovedConclusion(
+                id=row.id,
+                level=row.level,
+                content=row.content,
+                session_name=row.session_name,
+                replaced_by=(
+                    replacement.id
+                    if (replacement := replaced_by.get(row.id)) is not None
+                    else None
+                ),
+            )
+            for row in replaced
+        ],
+    )
 
 
 def _append_citations(
@@ -1691,8 +1810,8 @@ def _score_semantic_dup(
     # transport client; duplicate detection must work in local/offline tests
     # that provide an embedding directly without provider credentials.
     encoding = get_embedding_encoding()
-    tokens_new = set(encoding.encode(doc.content))
-    tokens_existing = set(encoding.encode(existing_doc.content))
+    tokens_new = set(encoding.encode(doc.content, disallowed_special=()))
+    tokens_existing = set(encoding.encode(existing_doc.content, disallowed_special=()))
     unique_new = len(tokens_new - tokens_existing)
     unique_existing = len(tokens_existing - tokens_new)
     score_new = len(tokens_new) + (unique_new * 10)
@@ -1921,56 +2040,89 @@ async def cleanup_soft_deleted_documents(
         minutes=older_than_minutes
     )
 
-    # Find soft-deleted documents ready for cleanup
-    # Use FOR UPDATE SKIP LOCKED to prevent multiple deriver instances from
-    # processing the same documents simultaneously
-    stmt = (
-        select(models.Document)
-        .where(models.Document.deleted_at.is_not(None))
-        .where(models.Document.deleted_at < cutoff)
-        .limit(batch_size)
-        .with_for_update(skip_locked=True)
-    )
-    result = await db.execute(stmt)
-    documents = list(result.scalars().all())
+    # Find soft-deleted documents ready for cleanup, oldest first (served by the
+    # partial ix_documents_deleted_at). Use FOR UPDATE SKIP LOCKED to prevent
+    # multiple deriver instances from processing the same documents simultaneously.
+    # region ai
+    # The sweep spans tenants, and a tenant whose vector namespace can't be resolved
+    # must not strand everyone else: its rows stay eligible, so a batch they fill
+    # would clean nothing, and the next cycle would select the same rows. When a
+    # batch contains such a tenant, it is excluded and the batch re-selected. Each
+    # round excludes at least one more tenant from a batch of at most batch_size
+    # rows, so the loop ends; flag-off there is one tenant and at most two rounds.
+    # endregion
+    prefixes: dict[str, str] = {}
+    unresolvable: set[str] = set()
+    while True:
+        stmt = (
+            select(models.Document)
+            .where(models.Document.deleted_at.is_not(None))
+            .where(models.Document.deleted_at < cutoff)
+        )
+        if unresolvable:
+            stmt = stmt.where(models.Document.tenant_id.not_in(unresolvable))
+        stmt = (
+            stmt.order_by(models.Document.deleted_at)
+            .limit(batch_size)
+            .with_for_update(skip_locked=True)
+        )
+        documents = list((await db.execute(stmt)).scalars().all())
+        if not documents:
+            await db.rollback()
+            return 0
 
-    if not documents:
-        return 0
+        newly_unresolvable: set[str] = set()
+        for tenant_id in {doc.tenant_id for doc in documents} - prefixes.keys():
+            try:
+                prefixes[tenant_id] = await prefix_for_tenant(tenant_id, db)
+            except (VectorNamespaceUnresolved, VectorStoreError):
+                logger.warning(
+                    "No vector namespace for tenant %s; leaving its soft-deleted documents",
+                    tenant_id,
+                )
+                newly_unresolvable.add(tenant_id)
+        if not newly_unresolvable:
+            break
+        unresolvable |= newly_unresolvable
 
     # Group by namespace for batch vector deletion
-    by_namespace: dict[str, list[str]] = {}
+    by_namespace: dict[str, list[models.Document]] = {}
     for doc in documents:
-        namespace = external_vector_store.get_vector_namespace(
+        namespace = await external_vector_store.get_vector_namespace(
             "document",
             doc.workspace_name,
             doc.observer,
             doc.observed,
+            prefix=prefixes[doc.tenant_id],
         )
-        by_namespace.setdefault(namespace, []).append(doc.id)
+        by_namespace.setdefault(namespace, []).append(doc)
 
     # Delete from external vector store (per namespace) and track successful deletions
-    successfully_deleted_ids: set[str] = set()
-    for namespace, ids in by_namespace.items():
+    successfully_deleted_keys: set[tuple[str, str]] = set()
+    for namespace, docs in by_namespace.items():
         try:
-            await external_vector_store.delete_many(namespace, ids)
-            # Only add to successfully_deleted_ids if vector deletion succeeded
-            successfully_deleted_ids.update(ids)
+            await external_vector_store.delete_many(namespace, [d.id for d in docs])
+            # Only add to successfully_deleted_keys if vector deletion succeeded
+            successfully_deleted_keys.update((d.tenant_id, d.id) for d in docs)
         except Exception as e:
             # Log but continue - vectors may already be deleted or namespace may not exist
             logger.warning(f"Failed to delete vectors from {namespace}: {e}")
 
     # Only hard delete documents where vector deletion succeeded
-    if successfully_deleted_ids:
+    # ai: keyed on (tenant_id, id), the PK — an id-only IN can't seek it and reads every partition's index
+    if successfully_deleted_keys:
         await db.execute(
             delete(models.Document).where(
-                models.Document.id.in_(successfully_deleted_ids)
+                tuple_(models.Document.tenant_id, models.Document.id).in_(
+                    successfully_deleted_keys
+                )
             )
         )
         await db.commit()
         logger.debug(
-            f"Cleaned up {len(successfully_deleted_ids)} soft-deleted documents"
+            f"Cleaned up {len(successfully_deleted_keys)} soft-deleted documents"
         )
-        return len(successfully_deleted_ids)
+        return len(successfully_deleted_keys)
 
     # No documents were successfully deleted from vector store
     # Release FOR UPDATE locks by rolling back the transaction
@@ -2004,7 +2156,7 @@ async def get_documents_by_ids(
     stmt = select(models.Document).where(
         models.Document.workspace_name == workspace_name,
         models.Document.id.in_(document_ids),
-        models.Document.deleted_at.is_(None),
+        live_document_row(workspace_name),
     )
     result = await db.execute(stmt)
     return result.scalars().all()
@@ -2036,9 +2188,12 @@ def get_child_observations(
         Select query for documents that reference this document as a source,
         for pagination support via apaginate()
     """
+    # An entity column, not literal(1): then the tenant predicate hook
+    # (models._add_tenant_predicate) adds tenant_id to this subquery.
     linked = (
-        select(literal(1))
+        select(models.DocumentSource.derived_id)
         .where(
+            models.DocumentSource.tenant_id == models.Document.tenant_id,
             models.DocumentSource.derived_id == models.Document.id,
             models.DocumentSource.source_id == parent_id,
         )
@@ -2046,9 +2201,10 @@ def get_child_observations(
     )
     # Undrained rows still carry linkage in the legacy JSONB column.
     stmt = select(models.Document).where(
+        models.Document.tenant_id == models.scoped_tenant_id(),
         models.Document.workspace_name == workspace_name,
         or_(linked, models.Document.legacy_source_ids.contains([parent_id])),
-        models.Document.deleted_at.is_(None),
+        live_document_row(workspace_name),
     )
     if observer:
         stmt = stmt.where(models.Document.observer == observer)
